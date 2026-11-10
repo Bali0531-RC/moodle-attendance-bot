@@ -37,12 +37,17 @@ export async function attachVirtualPasskeyToPage(page) {
 
     const saved = loadSavedPasskeys();
     for (const cred of saved) {
-      try {
-        await cdp.send('WebAuthn.addCredential', {
-          authenticatorId,
-          credential: cred,
-        });
-      } catch {}
+      // Add for the original rpId (e.g. accounts.meta.com) AND also clone for facebook.com & messenger.com
+      // in case Messenger/Facebook prompts WebAuthn directly on their own domain!
+      const domainsToRegister = new Set([cred.rpId, 'facebook.com', 'messenger.com'].filter(Boolean));
+      for (const rpId of domainsToRegister) {
+        try {
+          await cdp.send('WebAuthn.addCredential', {
+            authenticatorId,
+            credential: { ...cred, rpId },
+          });
+        } catch {}
+      }
     }
 
     cdp.on('WebAuthn.credentialAdded', async () => {
