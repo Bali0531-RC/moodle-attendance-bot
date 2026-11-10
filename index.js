@@ -7,6 +7,7 @@ import { decodeQrFromBuffer } from './qr.js';
 import { extractSixCharCode, getAiCredentials, loginGitHubCopilotDeviceFlow } from './extractor.js';
 import { ensureMoodleLoggedIn, submitQrUrl, submitSixCharCodeAcrossLinks } from './moodle.js';
 import { checkActiveSchedule } from './schedule.js';
+import { attachVirtualPasskeyAuthenticator, loadSavedPasskeys } from './passkey.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, 'config.json');
@@ -101,20 +102,23 @@ export async function checkAndRecoverMessengerSession(context, messengerPage) {
       }
     }
 
-    // 3. Check if Messenger E2EE (End-to-End Encryption) Passkey / Restore chat history modal popped up
-    // Often Messenger prompts "Verify with passkey" / "Azonosítás jelkulccsal". We should click "Use PIN" / "Try another way" / Close first!
-    const usePinInsteadBtn = messengerPage
-      .locator(
-        'div[role="button"]:has-text("PIN"), button:has-text("PIN"), div[role="button"]:has-text("another way"), div[role="button"]:has-text("másik mód"), a:has-text("PIN")'
-      )
-      .first();
-    if ((await usePinInsteadBtn.count()) > 0 && (await usePinInsteadBtn.isVisible())) {
-      console.log('🔐 [MESSENGER PASSKEY BYPASS] Passkey ablak észlelve -> átváltás PIN kódra...');
-      await usePinInsteadBtn.click().catch(() => {});
-      await messengerPage.waitForTimeout(1200);
+    // 3. Check if Facebook/Messenger is asking for a Passkey 2FA button ("Continue with passkey" / "Use passkey" / "Sign in with passkey")
+    // Since we have the CDP Virtual Passkey Authenticator attached, clicking this button will immediately sign the challenge in 0ms!
+    const savedPasskeys = loadSavedPasskeys();
+    if (savedPasskeys.length > 0) {
+      const passkeyLoginBtn = messengerPage
+        .locator(
+          'div[role="button"]:has-text("passkey"), button:has-text("passkey"), div[role="button"]:has-text("jelkulcs"), button:has-text("jelkulcs"), div[role="button"]:has-text("Passkey"), button:has-text("Passkey")'
+        )
+        .first();
+      if ((await passkeyLoginBtn.count()) > 0 && (await passkeyLoginBtn.isVisible())) {
+        console.log('⚡ [VIRTUAL PASSKEY 2FA] Passkey belépés gomb észlelve -> kattintás és automatikus kriptográfiai aláírás...');
+        await passkeyLoginBtn.click().catch(() => {});
+        await messengerPage.waitForTimeout(3000);
+      }
     }
 
-    // Check if Messenger E2EE 6-digit PIN input is visible
+    // 4. Check if Messenger E2EE 6-digit PIN input is visible
     const pinInput = messengerPage
       .locator(
         'input[autocomplete="one-time-code"], input#mw-numeric-code-input-prevent-composer-focus-steal, input[aria-label*="PIN" i], input[aria-label*="kód" i], input[type="password"][maxlength="6"]'
@@ -130,18 +134,6 @@ export async function checkAndRecoverMessengerSession(context, messengerPage) {
         console.warn(
           '⚠️ [MESSENGER E2EE PIN] A Messenger kéri a 6-jegyű titkosítási PIN kódot! Add meg a .env-ben (MESSENGER_PIN=123456) vagy a config.json-ban ("messenger_pin": "123456")!'
         );
-      }
-    }
-
-    // Also if a "Don't restore messages" / "Close" modal is blocking the chat when no PIN is needed
-    const closeDialogBtn = messengerPage
-      .locator('div[role="dialog"] div[aria-label="Close"], div[role="dialog"] div[aria-label="Bezárás"]')
-      .first();
-    if ((await closeDialogBtn.count()) > 0 && (await closeDialogBtn.isVisible())) {
-      const dialogText = await messengerPage.locator('div[role="dialog"]').first().innerText().catch(() => '');
-      if (/passkey|jelkulcs|pin|sync|szinkron|restore|visszaállít/i.test(dialogText)) {
-        console.log('🔐 [MESSENGER MODAL] Felugró Passkey/Szinkronizációs ablak bezárása...');
-        await closeDialogBtn.click().catch(() => {});
       }
     }
 
@@ -410,13 +402,15 @@ async function attachMessengerObserver(context, messengerPage, moodlePage) {
 /**
  * Interactive CLI menu so you can test simulated messages, QR images, or export auth state anytime!
  */
-function startInteractiveCli(context, messengerPage, moodlePage) {
+function startInteractiveCli(context, messengerPage, moodlePage, passkeyManager) {
   const aiCreds = getAiCredentials();
   const sched = checkActiveSchedule(config);
+  const passkeys = loadSavedPasskeys();
 
   console.log('\n============================================================');
   console.log('🤖 MOODLE ATTENDANCE BOT FUT ÉS FIGYEL!');
-  console.log(`🧠 AI Motor: ${aiCreds ? (aiCreds.isCopilot ? 'GitHub Copilot (AKTÍV ✅)' : 'Egyéni API (AKTÍV ✅)') : 'Csak Regex'}`);
+  console.log(`🧠 AI Motor:       ${aiCreds ? (aiCreds.isCopilot ? 'GitHub Copilot (AKTÍV ✅)' : 'Egyéni API (AKTÍV ✅)') : 'Csak Regex'}`);
+  console.log(`🔑 Virtuális 2FA:  ${passkeys.length} db mentett Passkey (.passkeys.json)`);
   console.log(`⏰ Órarend státusz: ${sched.active ? '🟢 AKTÍV' : '🟡 ALVÓ MÓD'} -> ${sched.reason}`);
   console.log('------------------------------------------------------------');
 
@@ -427,7 +421,9 @@ function startInteractiveCli(context, messengerPage, moodlePage) {
   }
 
   console.log('Parancsok a terminálban:');
-  console.log('  • save                                -> Kimenti az auth.json-t szerverre költöztetéshez');
+  console.log('  • passkey-register                    -> Megnyitja a Facebook Passkey beállítást új kulcs regisztrálásához!');
+  console.log('  • passkey-list                        -> Kilistázza az elmentett virtuális Passkey-eket (.passkeys.json)');
+  console.log('  • save                                -> Kimenti az auth.json-t és a Passkey-eket szerverre költöztetéshez');
   console.log('  • copilot-login                       -> Új GitHub Copilot fiók beléptetése');
   console.log('  • Bármilyen szöveg (pl. "kód: AB12CD") -> Szimulál egy Messenger üzenetet (idősávtól függetlenül!)');
   console.log('  • qr /eleresi/ut/kep.png              -> Letesztel egy QR kódos képfájlt');
@@ -444,7 +440,28 @@ function startInteractiveCli(context, messengerPage, moodlePage) {
     const input = line.trim();
     if (!input) return;
 
+    if (input === 'passkey-register') {
+      console.log('🔑 Facebook Accounts Center (Passkey/Jelkulcs létrehozás) megnyitása a Messenger fülön...');
+      console.log('👉 Kattints a böngészőben a "Passkey / Jelkulcs" -> "Create passkey / Jelkulcs létrehozása" gombra!');
+      console.log('👉 A bot virtuális FIDO2 chipje automatikusan elkapja és elmenti a .passkeys.json fájlba!');
+      await messengerPage.goto('https://accountscenter.facebook.com/password_and_security/passkeys', {
+        waitUntil: 'domcontentloaded',
+      }).catch(() => {});
+      return;
+    }
+
+    if (input === 'passkey-list') {
+      if (passkeyManager?.sync) await passkeyManager.sync();
+      const list = loadSavedPasskeys();
+      console.log(`🔑 Elmentett Passkey-ek (${list.length} db):`);
+      for (const pk of list) {
+        console.log(`   • Domain (rpId): ${pk.rpId} | Credential ID: ${pk.credentialId?.slice(0, 22)}... | SignCount: ${pk.signCount}`);
+      }
+      return;
+    }
+
     if (input === 'save' || input === 'export') {
+      if (passkeyManager?.sync) await passkeyManager.sync();
       await savePortableAuthState(context, true);
       return;
     }
@@ -455,7 +472,8 @@ function startInteractiveCli(context, messengerPage, moodlePage) {
     }
 
     if (input === 'exit' || input === 'quit') {
-      console.log('Belépési állapot mentése és leállítás...');
+      console.log('Belépési állapot + Passkey mentése és leállítás...');
+      if (passkeyManager?.sync) await passkeyManager.sync();
       await savePortableAuthState(context);
       await context.close();
       process.exit(0);
@@ -464,8 +482,10 @@ function startInteractiveCli(context, messengerPage, moodlePage) {
     if (input === 'status') {
       const currentSched = checkActiveSchedule(config);
       const fbValid = await hasValidMessengerSession(context);
+      const pks = loadSavedPasskeys();
       console.log(`📌 Messenger fül URL:    ${messengerPage.url()}`);
       console.log(`📌 Messenger Session:    ${fbValid ? '🟢 BELÉPVE (c_user & xs OK)' : '🔴 KIJELENTKEZVE!'}`);
+      console.log(`📌 Virtuális Passkey-ek: ${pks.length} db aktív (.passkeys.json)`);
       console.log(`📌 Moodle fül URL:       ${moodlePage.url()}`);
       console.log(`⏰ Órarend státusz:      ${currentSched.active ? '🟢 AKTÍV' : '🟡 ALVÓ MÓD'} (${currentSched.reason})`);
       return;
@@ -518,19 +538,12 @@ async function main() {
 
   await restorePortableAuthStateIfPresent(context);
 
-  // Disable WebAuthn / Passkey API in browser so Facebook/Messenger never tries hardware passkey prompts
-  await context.addInitScript(() => {
-    try {
-      delete window.PublicKeyCredential;
-      if (navigator.credentials) {
-        navigator.credentials.get = () => Promise.reject(new DOMException('NotAllowedError'));
-      }
-    } catch {}
-  });
-
   const pages = context.pages();
   const messengerPage = pages[0] || (await context.newPage());
   const moodlePage = pages[1] || (await context.newPage());
+
+  // Attach Chromium CDP Virtual FIDO2 Passkey Authenticator to Messenger tab
+  const passkeyManager = await attachVirtualPasskeyAuthenticator(messengerPage);
 
   await attachMessengerObserver(context, messengerPage, moodlePage);
 
@@ -565,7 +578,7 @@ async function main() {
     } catch {}
   }, keepAliveMs);
 
-  startInteractiveCli(context, messengerPage, moodlePage);
+  startInteractiveCli(context, messengerPage, moodlePage, passkeyManager);
 }
 
 main().catch((err) => {

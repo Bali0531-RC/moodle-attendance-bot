@@ -2,6 +2,7 @@ node_modules/
 .browser-profile/
 auth.json
 .copilot-token.json
+.passkeys.json
 .env
 *.log
 .DS_Store
