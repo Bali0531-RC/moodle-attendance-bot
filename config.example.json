@@ -1,5 +1,5 @@
 {
-  "messenger_group_url": "https://www.messenger.com/t/2238907013319198",
+  "messenger_group_url": "https://www.messenger.com/t/YOUR_GROUP_THREAD_ID",
   "moodle_base_url": "https://moodle.uni-pannon.hu",
   "headless": false,
   "keep_alive_minutes": 10,
@@ -24,10 +24,8 @@
     "Sunday": []
   },
   "attendance_urls": [
-    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=596153",
-    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=586640",
-    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=576818",
-    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=596165",
-    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=610847"
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=111111",
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=222222",
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=333333"
   ]
 }

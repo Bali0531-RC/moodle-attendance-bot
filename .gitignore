@@ -1,6 +1,7 @@
 node_modules/
 .browser-profile/
 auth.json
+config.json
 .copilot-token.json
 .passkeys.json
 .env

@@ -10,7 +10,9 @@ import { checkActiveSchedule } from './schedule.js';
 import { attachVirtualPasskeyAuthenticator, loadSavedPasskeys } from './passkey.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(__dirname, 'config.json');
+const CONFIG_PATH = fs.existsSync(path.join(__dirname, 'config.json'))
+  ? path.join(__dirname, 'config.json')
+  : path.join(__dirname, 'config.example.json');
 const USER_DATA_DIR = path.join(__dirname, '.browser-profile');
 const AUTH_STATE_PATH = path.join(__dirname, 'auth.json');
 
