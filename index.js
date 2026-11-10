@@ -101,10 +101,23 @@ export async function checkAndRecoverMessengerSession(context, messengerPage) {
       }
     }
 
-    // 3. Check if Messenger E2EE (End-to-End Encryption) 6-digit PIN modal popped up
+    // 3. Check if Messenger E2EE (End-to-End Encryption) Passkey / Restore chat history modal popped up
+    // Often Messenger prompts "Verify with passkey" / "Azonosítás jelkulccsal". We should click "Use PIN" / "Try another way" / Close first!
+    const usePinInsteadBtn = messengerPage
+      .locator(
+        'div[role="button"]:has-text("PIN"), button:has-text("PIN"), div[role="button"]:has-text("another way"), div[role="button"]:has-text("másik mód"), a:has-text("PIN")'
+      )
+      .first();
+    if ((await usePinInsteadBtn.count()) > 0 && (await usePinInsteadBtn.isVisible())) {
+      console.log('🔐 [MESSENGER PASSKEY BYPASS] Passkey ablak észlelve -> átváltás PIN kódra...');
+      await usePinInsteadBtn.click().catch(() => {});
+      await messengerPage.waitForTimeout(1200);
+    }
+
+    // Check if Messenger E2EE 6-digit PIN input is visible
     const pinInput = messengerPage
       .locator(
-        'input[autocomplete="one-time-code"], input#mw-numeric-code-input-prevent-composer-focus-steal, input[aria-label*="PIN" i], input[aria-label*="kód" i]'
+        'input[autocomplete="one-time-code"], input#mw-numeric-code-input-prevent-composer-focus-steal, input[aria-label*="PIN" i], input[aria-label*="kód" i], input[type="password"][maxlength="6"]'
       )
       .first();
     if ((await pinInput.count()) > 0 && (await pinInput.isVisible())) {
@@ -112,11 +125,23 @@ export async function checkAndRecoverMessengerSession(context, messengerPage) {
       if (e2eePin) {
         console.log('🔐 [MESSENGER E2EE PIN] Titkosított chat PIN ablak észlelve, automatikus kitöltés...');
         await pinInput.fill(String(e2eePin));
-        await messengerPage.waitForTimeout(2000);
+        await messengerPage.waitForTimeout(2500);
       } else {
         console.warn(
-          '⚠️ [MESSENGER E2EE PIN] A Messenger kéri a 6-jegyű titkosítási PIN kódot! Add meg a .env-ben (MESSENGER_PIN=123456) vagy írd be az ablakban!'
+          '⚠️ [MESSENGER E2EE PIN] A Messenger kéri a 6-jegyű titkosítási PIN kódot! Add meg a .env-ben (MESSENGER_PIN=123456) vagy a config.json-ban ("messenger_pin": "123456")!'
         );
+      }
+    }
+
+    // Also if a "Don't restore messages" / "Close" modal is blocking the chat when no PIN is needed
+    const closeDialogBtn = messengerPage
+      .locator('div[role="dialog"] div[aria-label="Close"], div[role="dialog"] div[aria-label="Bezárás"]')
+      .first();
+    if ((await closeDialogBtn.count()) > 0 && (await closeDialogBtn.isVisible())) {
+      const dialogText = await messengerPage.locator('div[role="dialog"]').first().innerText().catch(() => '');
+      if (/passkey|jelkulcs|pin|sync|szinkron|restore|visszaállít/i.test(dialogText)) {
+        console.log('🔐 [MESSENGER MODAL] Felugró Passkey/Szinkronizációs ablak bezárása...');
+        await closeDialogBtn.click().catch(() => {});
       }
     }
 
@@ -492,6 +517,16 @@ async function main() {
   });
 
   await restorePortableAuthStateIfPresent(context);
+
+  // Disable WebAuthn / Passkey API in browser so Facebook/Messenger never tries hardware passkey prompts
+  await context.addInitScript(() => {
+    try {
+      delete window.PublicKeyCredential;
+      if (navigator.credentials) {
+        navigator.credentials.get = () => Promise.reject(new DOMException('NotAllowedError'));
+      }
+    } catch {}
+  });
 
   const pages = context.pages();
   const messengerPage = pages[0] || (await context.newPage());
