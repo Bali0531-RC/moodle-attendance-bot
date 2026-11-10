@@ -32,25 +32,147 @@ const recentChatHistory = [];
 let activeSubmissionPromise = null;
 
 /**
- * Exports all cookies + localStorage + IndexedDB (Messenger E2EE keys & Microsoft KCA tokens)
- * into a portable auth.json file that works on any headless Linux server.
+ * Checks if the context actually has a logged-in Messenger user cookie (c_user + xs)
+ * AND a logged-in Moodle / Microsoft session before overwriting auth.json!
  */
-async function savePortableAuthState(context) {
+async function hasValidMessengerSession(context) {
   try {
+    const cookies = await context.cookies(['https://www.messenger.com', 'https://www.facebook.com']);
+    const hasCUser = cookies.some((c) => c.name === 'c_user' && c.value);
+    const hasXs = cookies.some((c) => c.name === 'xs' && c.value);
+    return hasCUser && hasXs;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detects if Messenger tab is logged out, asking for "Continue as...", or asking for the 6-digit E2EE PIN.
+ * Automatically recovers if possible or logs a clear alert!
+ */
+export async function checkAndRecoverMessengerSession(context, messengerPage) {
+  try {
+    const url = messengerPage.url();
+    const cookiesValid = await hasValidMessengerSession(context);
+
+    // 1. Check if there is a "Continue as [Name]" / "Folytatás mint..." one-click button
+    const continueBtn = messengerPage
+      .locator(
+        'button:has-text("Continue as"), button:has-text("Folytatás"), div[role="button"]:has-text("Continue as"), div[role="button"]:has-text("Folytatás")'
+      )
+      .first();
+    if ((await continueBtn.count()) > 0 && (await continueBtn.isVisible())) {
+      console.log('🔐 [MESSENGER AUTO-LOGIN] "Folytatás mint..." gomb észlelve, kattintás...');
+      await continueBtn.click();
+      await messengerPage.waitForTimeout(3000);
+    }
+
+    // 2. Check if Messenger is asking for email + password login form
+    const loginInput = messengerPage.locator('input[name="email"], input#email').first();
+    const passInput = messengerPage.locator('input[name="pass"], input#pass').first();
+    const isLoginScreen =
+      !cookiesValid ||
+      url.includes('/login') ||
+      ((await loginInput.count()) > 0 && (await loginInput.isVisible()));
+
+    if (isLoginScreen) {
+      const fbEmail = process.env.FB_EMAIL?.trim();
+      const fbPass = process.env.FB_PASS?.trim();
+
+      if (fbEmail && fbPass && (await loginInput.count()) > 0) {
+        console.log('🔐 [MESSENGER AUTO-LOGIN] Kijelentkezés észlelve! Automatikus belépés FB_EMAIL / FB_PASS-szal...');
+        await loginInput.fill(fbEmail);
+        await passInput.fill(fbPass);
+        const keepSignedIn = messengerPage.locator('input[name="persistent"], input[type="checkbox"]').first();
+        if ((await keepSignedIn.count()) > 0) {
+          await keepSignedIn.check().catch(() => {});
+        }
+        const submitBtn = messengerPage.locator('button[name="login"], button#loginbutton, button[type="submit"]').first();
+        await Promise.all([
+          messengerPage.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {}),
+          submitBtn.click(),
+        ]);
+        await messengerPage.waitForTimeout(4000);
+      } else {
+        console.error(
+          `🚨 [MESSENGER KIJELENTKEZVE!] A Messenger nincs belépve (hiányzik a c_user/xs süti, URL: ${url})! Lépj be újra és futtasd a "save" parancsot (vagy add meg az FB_EMAIL / FB_PASS értékeket a .env-ben)!`
+        );
+        return false;
+      }
+    }
+
+    // 3. Check if Messenger E2EE (End-to-End Encryption) 6-digit PIN modal popped up
+    const pinInput = messengerPage
+      .locator(
+        'input[autocomplete="one-time-code"], input#mw-numeric-code-input-prevent-composer-focus-steal, input[aria-label*="PIN" i], input[aria-label*="kód" i]'
+      )
+      .first();
+    if ((await pinInput.count()) > 0 && (await pinInput.isVisible())) {
+      const e2eePin = process.env.MESSENGER_PIN?.trim() || config.messenger_pin;
+      if (e2eePin) {
+        console.log('🔐 [MESSENGER E2EE PIN] Titkosított chat PIN ablak észlelve, automatikus kitöltés...');
+        await pinInput.fill(String(e2eePin));
+        await messengerPage.waitForTimeout(2000);
+      } else {
+        console.warn(
+          '⚠️ [MESSENGER E2EE PIN] A Messenger kéri a 6-jegyű titkosítási PIN kódot! Add meg a .env-ben (MESSENGER_PIN=123456) vagy írd be az ablakban!'
+        );
+      }
+    }
+
+    // 4. Verify we are actually on the target group thread
+    if (
+      cookiesValid &&
+      config.messenger_group_url &&
+      !messengerPage.url().includes('/t/')
+    ) {
+      await messengerPage.goto(config.messenger_group_url, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    }
+
+    const finalValid = await hasValidMessengerSession(context);
+    if (finalValid) {
+      console.log('✅ [MESSENGER STATUS] Session aktív (c_user & xs sütik érvényesek)!');
+    }
+    return finalValid;
+  } catch (err) {
+    console.warn(`⚠️ [MESSENGER CHECK HIBA] ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Exports all cookies + localStorage + IndexedDB (Messenger E2EE keys & Microsoft KCA tokens)
+ * into a portable auth.json file ONLY IF Messenger is actually logged in (prevents overwriting good auth.json with logged-out state!).
+ */
+async function savePortableAuthState(context, force = false) {
+  try {
+    const validMessenger = await hasValidMessengerSession(context);
+    if (!validMessenger && !force && fs.existsSync(AUTH_STATE_PATH)) {
+      console.warn(
+        '⚠️ [MENTÉS MEGTAGADVA] A Messenger jelenleg nincs belépve (hiányzik a c_user süti), ezért NEM írjuk felül a meglévő auth.json fájlt!'
+      );
+      return false;
+    }
+
     await context.storageState({ path: AUTH_STATE_PATH, indexedDB: true });
-    console.log(`💾 [MENTÉS KÉSZ] Hordozható belépési állapot (Cookies + IndexedDB) elmentve ide: ${AUTH_STATE_PATH}`);
+    console.log(
+      `💾 [MENTÉS KÉSZ] Hordozható belépési állapot (Messenger: ${validMessenger ? 'BELÉPVE ✅' : 'NINCS BELÉPVE ⚠️'}) elmentve ide: ${AUTH_STATE_PATH}`
+    );
+    return true;
   } catch (err) {
     try {
       await context.storageState({ path: AUTH_STATE_PATH });
       console.log(`💾 [MENTÉS KÉSZ] Sütik és localStorage elmentve ide: ${AUTH_STATE_PATH}`);
+      return true;
     } catch (e2) {
       console.error(`❌ [MENTÉS HIBA] ${e2.message}`);
+      return false;
     }
   }
 }
 
 /**
- * Restores cookies from auth.json into the persistent context if available (useful right after moving to a new server).
+ * Restores cookies from auth.json into the persistent context if available.
  */
 async function restorePortableAuthStateIfPresent(context) {
   if (!fs.existsSync(AUTH_STATE_PATH)) return;
@@ -58,7 +180,12 @@ async function restorePortableAuthStateIfPresent(context) {
     const state = JSON.parse(fs.readFileSync(AUTH_STATE_PATH, 'utf-8'));
     if (Array.isArray(state.cookies) && state.cookies.length > 0) {
       await context.addCookies(state.cookies);
-      console.log(`🔑 [AUTH BETÖLTVE] ${state.cookies.length} süti betöltve az auth.json fájlból!`);
+      const hasFbUser = state.cookies.some((c) => c.name === 'c_user');
+      console.log(
+        `🔑 [AUTH BETÖLTVE] ${state.cookies.length} süti betöltve az auth.json-ból (Messenger c_user süti: ${
+          hasFbUser ? 'VAN ✅' : 'HIÁNYZIK ❌'
+        })!`
+      );
     }
   } catch (err) {
     console.warn(`⚠️ [AUTH BETÖLTÉS] Nem sikerült betölteni az auth.json-t: ${err.message}`);
@@ -279,7 +406,7 @@ function startInteractiveCli(context, messengerPage, moodlePage) {
   console.log('  • copilot-login                       -> Új GitHub Copilot fiók beléptetése');
   console.log('  • Bármilyen szöveg (pl. "kód: AB12CD") -> Szimulál egy Messenger üzenetet (idősávtól függetlenül!)');
   console.log('  • qr /eleresi/ut/kep.png              -> Letesztel egy QR kódos képfájlt');
-  console.log('  • status                              -> Ellenőrzi a belépett füleket és az órarendet');
+  console.log('  • status                              -> Ellenőrzi a belépett füleket és a Messenger sütiket');
   console.log('  • exit                                -> Mentés és kilépés');
   console.log('============================================================\n');
 
@@ -293,7 +420,7 @@ function startInteractiveCli(context, messengerPage, moodlePage) {
     if (!input) return;
 
     if (input === 'save' || input === 'export') {
-      await savePortableAuthState(context);
+      await savePortableAuthState(context, true);
       return;
     }
 
@@ -311,9 +438,11 @@ function startInteractiveCli(context, messengerPage, moodlePage) {
 
     if (input === 'status') {
       const currentSched = checkActiveSchedule(config);
-      console.log(`📌 Messenger fül URL: ${messengerPage.url()}`);
-      console.log(`📌 Moodle fül URL:    ${moodlePage.url()}`);
-      console.log(`⏰ Órarend státusz:   ${currentSched.active ? '🟢 AKTÍV' : '🟡 ALVÓ MÓD'} (${currentSched.reason})`);
+      const fbValid = await hasValidMessengerSession(context);
+      console.log(`📌 Messenger fül URL:    ${messengerPage.url()}`);
+      console.log(`📌 Messenger Session:    ${fbValid ? '🟢 BELÉPVE (c_user & xs OK)' : '🔴 KIJELENTKEZVE!'}`);
+      console.log(`📌 Moodle fül URL:       ${moodlePage.url()}`);
+      console.log(`⏰ Órarend státusz:      ${currentSched.active ? '🟢 AKTÍV' : '🟡 ALVÓ MÓD'} (${currentSched.reason})`);
       return;
     }
 
@@ -333,7 +462,6 @@ function startInteractiveCli(context, messengerPage, moodlePage) {
       return;
     }
 
-    // Manual CLI test bypasses schedule check so you can test anytime at night/weekends!
     processedTexts.delete(input);
     await onNewChatMessage(moodlePage, input, true);
   });
@@ -373,6 +501,8 @@ async function main() {
 
   console.log(`🌐 Messenger megnyitása: ${config.messenger_group_url}`);
   await messengerPage.goto(config.messenger_group_url, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  await messengerPage.waitForTimeout(2500);
+  await checkAndRecoverMessengerSession(context, messengerPage);
 
   console.log(`🎓 Moodle megnyitása: ${config.moodle_base_url}`);
   await moodlePage.goto(config.moodle_base_url, { waitUntil: 'domcontentloaded' }).catch(() => {});
@@ -380,12 +510,19 @@ async function main() {
 
   setTimeout(() => savePortableAuthState(context), 15000);
 
-  // Keep Moodle + KCA session alive
+  // Periodic health check on Messenger (every 2 minutes) + Moodle/KCA keep-alive (every 10 minutes)
+  setInterval(async () => {
+    try {
+      await checkAndRecoverMessengerSession(context, messengerPage);
+    } catch {}
+  }, 2 * 60 * 1000);
+
   const keepAliveMs = (config.keep_alive_minutes || 10) * 60 * 1000;
   setInterval(async () => {
     try {
       if (!activeSubmissionPromise) {
-        console.log('🔄 [KEEP-ALIVE] Moodle & KCA session frissítése...');
+        console.log('🔄 [KEEP-ALIVE] Moodle, KCA & Messenger session ellenőrzése...');
+        await checkAndRecoverMessengerSession(context, messengerPage);
         await moodlePage.goto(config.moodle_base_url, { waitUntil: 'domcontentloaded', timeout: 12000 });
         await ensureMoodleLoggedIn(moodlePage, config.moodle_base_url);
         await savePortableAuthState(context);
