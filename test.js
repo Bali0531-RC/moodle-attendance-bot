@@ -3,7 +3,7 @@ import { chromium } from 'playwright';
 import { decodeQrFromBuffer } from './qr.js';
 import { extractSixCharCode } from './extractor.js';
 import { submitQrUrl, submitSixCharCodeAcrossLinks } from './moodle.js';
-import { checkActiveSchedule } from './schedule.js';
+import { checkActiveSchedule, checkCourseSchedule } from './schedule.js';
 
 /**
  * Self-contained automated E2E test:
@@ -85,6 +85,7 @@ async function runSelfTest() {
     // Attendance submission form page
     if (url.pathname === '/mod/attendance/attendance.php' && req.method === 'GET') {
       const qrpass = url.searchParams.get('qrpass');
+      const sessid = url.searchParams.get('sessid');
       if (qrpass === 'FASTQR') {
         submittedFormData = { qrpass: 'FASTQR', autoRecorded: true };
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -92,9 +93,12 @@ async function runSelfTest() {
         return;
       }
 
+      // If sessid=5303 (e.g. Prog 1 other group's session), return breadcrumb linking to view.php?id=586640
+      const courseViewId = sessid === '5303' ? '586640' : '44444';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`
-        <html><body>
+        <html><head><title>Prog 1 Jelenlét</title></head><body>
+          <nav><a href="/mod/attendance/view.php?id=${courseViewId}">Jelenléti ív</a></nav>
           <form action="/mod/attendance/attendance.php" method="POST">
             <label>Password: <input type="text" name="studentpassword" /></label>
             <label><input type="radio" name="status" value="present_id" /> Present</label>
@@ -152,9 +156,8 @@ async function runSelfTest() {
     }
     console.log('✅ 6 linken végigfutás + "Present" + "X7B9K2" beküldés sikeres:', submittedFormData);
 
-    console.log('\n🧪 3. TESZT: QR-kód dekódolás sebesség és azonnali Moodle megnyitás...');
-    const qrTargetUrl = `${base}/mod/attendance/attendance.php?sessid=999&qrpass=FASTQR`;
-    // Render a simple QR SVG/Canvas via inline JS or test image
+    console.log('\n🧪 3. TESZT: QR-kód dekódolás, sessid visszavezetés (course_schedules) és deduplikáció...');
+    const qrTargetUrl = `${base}/mod/attendance/attendance.php?sessid=777&qrpass=FASTQR`;
     await page.setContent(`
       <html><body>
         <img id="qr" src="https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(qrTargetUrl)}" />
@@ -177,7 +180,34 @@ async function runSelfTest() {
     if (!qrOk || !submittedFormData?.autoRecorded) {
       throw new Error('QR URL beküldés sikertelen');
     }
-    console.log('✅ QR kód <1mp alatt dekódolva és Moodle-ben érvényesítve!');
+
+    // Test deduplication: sending a 2nd QR for the same sessid=777 should be skipped immediately
+    submittedFormData = null;
+    await submitQrUrl(page, `${base}/mod/attendance/attendance.php?sessid=777&qrpass=SECONDQR`);
+    if (submittedFormData !== null) {
+      throw new Error('Deduplikáció hiba: újra megnyitotta ugyanazt a sessid-t!');
+    }
+
+    // Test course_schedules rejection: sessid=5303 belongs to course 586640 (Prog 1), which is only allowed on Friday 18:00-20:00
+    const restrictedConfig = {
+      timezone: 'Europe/Budapest',
+      course_schedules: {
+        [`${base}/mod/attendance/view.php?id=586640`]: {
+          name: 'Programozás 1 gyakorlat',
+          buffer_before_minutes: 10,
+          windows: [{ day: 'Sunday', start: '23:50', end: '23:59' }],
+        },
+      },
+    };
+    const rejected = await submitQrUrl(
+      page,
+      `${base}/mod/attendance/attendance.php?sessid=5303&qrpass=FASTQR`,
+      restrictedConfig
+    );
+    if (rejected !== false || submittedFormData !== null) {
+      throw new Error('Course schedule szűrés hiba: nem tiltotta le a másik csoport QR kódját!');
+    }
+    console.log('✅ QR kód dekódolás, sessid deduplikáció és más csoport QR kiszűrése (course_schedules) hibátlan!');
   } finally {
     await browser.close();
     server.close();

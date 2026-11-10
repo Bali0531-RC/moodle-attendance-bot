@@ -22,22 +22,8 @@ function parseTimeToMinutes(hhmm) {
   return (h || 0) * 60 + (m || 0);
 }
 
-/**
- * Checks if the current time (or a given Date) falls inside any of the configured
- * daily time windows in `config.active_schedule`.
- *
- * Returns:
- *   { active: boolean, dayName: string, currentTime: string, reason: string }
- */
-export function checkActiveSchedule(config, now = new Date()) {
+function getCurrentTimeParts(config, now = new Date()) {
   const timeZone = config.timezone || 'Europe/Budapest';
-  const schedule = config.active_schedule;
-
-  // If no active_schedule is configured, always active
-  if (!schedule || Object.keys(schedule).length === 0) {
-    return { active: true, dayName: 'All', currentTime: '', reason: 'Nincs időkorlát beállítva' };
-  }
-
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
     weekday: 'long',
@@ -52,7 +38,22 @@ export function checkActiveSchedule(config, now = new Date()) {
   const currentTime = `${hourStr === '24' ? '00' : hourStr}:${minuteStr}`;
   const currentMinutes = parseTimeToMinutes(currentTime);
 
-  // Normalize keys in config.active_schedule so both "Monday" and "Hétfő" work
+  return { weekdayRaw, currentTime, currentMinutes };
+}
+
+/**
+ * Checks if the current time (or a given Date) falls inside any of the configured
+ * daily time windows in `config.active_schedule`.
+ */
+export function checkActiveSchedule(config, now = new Date()) {
+  const schedule = config.active_schedule;
+
+  if (!schedule || Object.keys(schedule).length === 0) {
+    return { active: true, dayName: 'All', currentTime: '', reason: 'Nincs időkorlát beállítva' };
+  }
+
+  const { weekdayRaw, currentTime, currentMinutes } = getCurrentTimeParts(config, now);
+
   let dayWindows = [];
   for (const [key, val] of Object.entries(schedule)) {
     const normalizedDay = DAY_MAP[key.toLowerCase().trim()] || key;
@@ -91,5 +92,93 @@ export function checkActiveSchedule(config, now = new Date()) {
     dayName: weekdayRaw,
     currentTime,
     reason: `Idősávon kívül (${weekdayRaw} ${currentTime}, engedélyezve: ${rangesStr})`,
+  };
+}
+
+/**
+ * Extracts all course/attendance IDs from an attendance URL or course URL
+ * e.g. "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=586640" -> "586640"
+ */
+export function extractUrlId(urlOrId) {
+  if (!urlOrId) return '';
+  const str = String(urlOrId).trim();
+  if (/^\d+$/.test(str)) return str;
+  const match = str.match(/[?&]id=(\d+)/i);
+  return match ? match[1] : str;
+}
+
+/**
+ * Checks if a specific course (identified by its attendance URL, course URL, or numeric ID)
+ * has optional time-window restrictions in `config.course_schedules`.
+ *
+ * - If the course is NOT listed in `config.course_schedules` (or has an empty windows array),
+ *   it returns `{ allowed: true }` (no restriction for that course).
+ * - If the course IS listed in `config.course_schedules`, it checks whether `now` is within
+ *   `[start - buffer_before_minutes, end]` (default buffer: 10 minutes before class).
+ */
+export function checkCourseSchedule(config, courseIdentifier, now = new Date()) {
+  const courseSchedules = config.course_schedules;
+  if (!courseSchedules || Object.keys(courseSchedules).length === 0 || !courseIdentifier) {
+    return { allowed: true, reason: 'Nincs tárgy-specifikus korlátozás' };
+  }
+
+  const targetId = extractUrlId(courseIdentifier);
+  const targetStr = String(courseIdentifier).toLowerCase();
+
+  let matchedRule = null;
+  let matchedKey = null;
+
+  for (const [key, rule] of Object.entries(courseSchedules)) {
+    const keyId = extractUrlId(key);
+    if (
+      (targetId && keyId && targetId === keyId) ||
+      targetStr.includes(key.toLowerCase()) ||
+      key.toLowerCase().includes(targetStr)
+    ) {
+      matchedRule = rule;
+      matchedKey = key;
+      break;
+    }
+  }
+
+  if (!matchedRule) {
+    return { allowed: true, reason: 'Erre a tárgyra nincs külön csoport-idősáv megadva' };
+  }
+
+  const windows = Array.isArray(matchedRule) ? matchedRule : matchedRule.windows;
+  const courseName = matchedRule.name || matchedKey;
+  const bufferBefore =
+    typeof matchedRule.buffer_before_minutes === 'number'
+      ? matchedRule.buffer_before_minutes
+      : 10; // Default -10 min pre-class buffer
+
+  if (!Array.isArray(windows) || windows.length === 0) {
+    return { allowed: true, courseName, reason: `${courseName}: üres idősáv lista (mindig engedélyezve)` };
+  }
+
+  const { weekdayRaw, currentTime, currentMinutes } = getCurrentTimeParts(config, now);
+
+  for (const win of windows) {
+    if (!win.day || !win.start || !win.end) continue;
+    const normDay = DAY_MAP[String(win.day).toLowerCase().trim()] || win.day;
+    if (normDay.toLowerCase() !== weekdayRaw.toLowerCase()) continue;
+
+    const startMin = parseTimeToMinutes(win.start) - bufferBefore;
+    const endMin = parseTimeToMinutes(win.end);
+
+    if (currentMinutes >= startMin && currentMinutes <= endMin) {
+      return {
+        allowed: true,
+        courseName,
+        reason: `${courseName}: Saját csoport idősávban (${normDay} ${win.start}-${win.end}, -${bufferBefore}p bufferrel, most: ${currentTime})`,
+      };
+    }
+  }
+
+  const winSummary = windows.map((w) => `${w.day} ${w.start}-${w.end}`).join(', ');
+  return {
+    allowed: false,
+    courseName,
+    reason: `"${courseName}" most nem a te csoportod órája! (Most: ${weekdayRaw} ${currentTime} | Saját sávod: ${winSummary}, -${bufferBefore}p bufferrel)`,
   };
 }

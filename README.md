@@ -73,11 +73,23 @@ Szerkeszd a **`config.json`** fájlt:
   "attendance_urls": [
     "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=111111",
     "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=222222"
-  ]
+  ],
+  "course_schedules": {
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=222222": {
+      "name": "Programozás 1 gyakorlat (Csak a saját csoportom sávja!)",
+      "buffer_before_minutes": 10,
+      "windows": [
+        { "day": "Wednesday", "start": "08:00", "end": "10:00" }
+      ]
+    }
+  }
 }
 ```
 - **`active_schedule`**: Naponként megadhatod, mettől meddig figyeljen a bot (akár több idősávot is megadhatsz egy napon belül). Idősávon kívül **Alvó módba** kapcsol (nem hív AI-t és nem nyit meg semmit). Ha menet közben átírod a `config.json`-t, a bot újraindítás nélkül azonnal újratölti!
 - **`attendance_urls`**: A felvett tárgyaid Moodle Jelenlét (`.../mod/attendance/view.php?id=...`) linkjei.
+- **`course_schedules` (Opcionális, több gyakorlati csoportos tárgyakhoz!):** Ha egy tárgyból több gyakorlati csoport van a héten és más csoportok is beküldik a közös Messengerbe a QR-kódjukat, itt megadhatod a tárgy `view.php?id=...` linkjéhez a **saját csoportod** pontos idősávját (`buffer_before_minutes: 10` perces óra előtti tűréssel).
+  - Amikor bejön egy QR-kód (`...attendance.php?qrpass=...&sessid=5303`), a bot először **levágja róla a `qrpass`-t**, és ~100ms alatt megnézi, melyik tárgyhoz tartozik a `sessid=5303`. Ha a tárgy szerepel a `course_schedules`-ben, és épp nincs (és 10 percen belül sem lesz) belőle órád, **nem küldi be a jelenlétet** (`🛑 [QR SKIPPELVE - MÁS CSOPORT ÓRÁJA!]`)!
+  - Ugyanerre a `sessid`-re érkező további QR fotókat automatikusan deduplikálja (`⏭️ [QR DEDUPE]`), és a QR-kódok mindig elsőbbséget élveznek a 6-jegyű kód kereséssel szemben.
 
 Szerkeszd a **`.env`** fájlt:
 ```ini

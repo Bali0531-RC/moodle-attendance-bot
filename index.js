@@ -269,7 +269,7 @@ async function onNewChatImage(context, messengerPage, moodlePage, imgSrc, bypass
   if (decoded) {
     console.log(`\n📸 [QR DETEKTÁLVA - ${decodeMs}ms] Tartalom: ${decoded}`);
     if (/^https?:\/\//i.test(decoded)) {
-      await submitQrUrl(moodlePage, decoded);
+      await submitQrUrl(moodlePage, decoded, config);
     } else if (/^[A-Za-z0-9]{6}$/.test(decoded)) {
       console.log(`🔑 [QR 6-JEGYŰ KÓD] A QR kód egy 6 jegyű kódot rejtett: ${decoded}`);
       triggerSixCharSubmission(moodlePage, decoded);
@@ -302,7 +302,7 @@ async function onNewChatMessage(moodlePage, text, bypassSchedule = false) {
   const linkMatch = clean.match(/https?:\/\/\S+mod\/attendance\/\S+/i);
   if (linkMatch) {
     console.log(`🔗 [ATTENDANCE LINK CHATBEN] ${linkMatch[0]}`);
-    await submitQrUrl(moodlePage, linkMatch[0]);
+    await submitQrUrl(moodlePage, linkMatch[0], config);
     return;
   }
 
@@ -505,7 +505,7 @@ function startInteractiveCli(context, messengerPage, moodlePage, passkeyManager)
       const decoded = await decodeQrFromBuffer(buf);
       console.log(`📸 [TESZT QR - ${Date.now() - t0}ms] Dekódolt érték: ${decoded || 'NEM TALÁLHATÓ QR'}`);
       if (decoded && /^https?:\/\//i.test(decoded)) {
-        await submitQrUrl(moodlePage, decoded);
+        await submitQrUrl(moodlePage, decoded, config);
       }
       return;
     }

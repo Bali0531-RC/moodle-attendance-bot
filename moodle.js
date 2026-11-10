@@ -1,11 +1,15 @@
+import { checkCourseSchedule } from './schedule.js';
+
 /**
  * Handles Moodle Attendance submission for both:
- * 1. Fast QR Code URLs (<15s rotating token or direct qrpass link)
- * 2. 6-character password scanning across the configured course Attendance links (with -10 min pre-class retry support)
+ * 1. Fast QR Code URLs (<15s rotating token or direct qrpass link) with:
+ *    - `sessid` deduplication (never submits the same session twice)
+ *    - Pre-flight `sessid` -> Course resolution (`course_schedules` check BEFORE recording attendance!)
+ *    - Instant priority (preempts any running 6-character code search)
+ * 2. 6-character password scanning across configured course Attendance links (filtered by `course_schedules` + -10 min pre-class retry)
  * 3. Automatic KCA / Microsoft SSO session recovery if Moodle logs out
  */
 
-// Labels for the "Submit attendance" link in Moodle (English & Hungarian & German)
 const SUBMIT_LINK_SELECTORS = [
   'a:has-text("Submit attendance")',
   'a:has-text("Jelenlét rögzítése")',
@@ -13,12 +17,20 @@ const SUBMIT_LINK_SELECTORS = [
   'a[href*="mod/attendance/attendance.php?sessid="]',
 ];
 
-// Labels for the "Present" radio button in Moodle (English & Hungarian)
-const PRESENT_LABELS = ['Present', 'Jelen', 'Jelenlévő', 'Anwesend'];
+const PRESENT_LABELS = ['Present', 'Jelen', 'Jelenlévő', 'Anwesend', 'Részvétel'];
+
+// Session deduplication & concurrency locks
+const completedSessionIds = new Set();
+const inFlightSessionIds = new Set();
+const sessionToCourseCache = new Map(); // sessid -> { attendanceId, courseId, title }
+let qrPreemptCount = 0; // > 0 whenever a high-priority QR submission is running
+
+export function isQrRunning() {
+  return qrPreemptCount > 0;
+}
 
 /**
- * Extracts the exact notification / alert / main status message shown on the Moodle page
- * so you always see Moodle's real response in the console.
+ * Extracts the exact notification / alert / main status message shown on the Moodle page.
  */
 async function inspectMoodlePageOutcome(page) {
   try {
@@ -46,25 +58,19 @@ async function inspectMoodlePageOutcome(page) {
     });
 
     const combined = `${info.heading} | ${info.alerts.join(' | ')} | ${info.mainText}`;
-    const cleanSummary = info.alerts.length > 0
-      ? `${info.heading ? info.heading + ': ' : ''}${info.alerts.join(' | ')}`
-      : info.mainText.slice(0, 180);
+    const cleanSummary =
+      info.alerts.length > 0
+        ? `${info.heading ? info.heading + ': ' : ''}${info.alerts.join(' | ')}`
+        : info.mainText.slice(0, 180);
 
-    // 1. Freshly recorded attendance
-    if (
-      /attendance in this session has been recorded|jelenléte.*rögzítve|sikeresen rögzít/i.test(combined)
-    ) {
+    if (/attendance in this session has been recorded|jelenléte.*rögzítve|sikeresen rögzít/i.test(combined)) {
       return { status: 'recorded', success: true, message: cleanSummary };
     }
 
-    // 2. Already recorded earlier ("Nem módosíthat már rögzített jelenlétet")
-    if (
-      /nem módosíthat már rögzített jelenlétet|already.*recorded|cannot.*modify|már rögzített/i.test(combined)
-    ) {
+    if (/nem módosíthat már rögzített jelenlétet|already.*recorded|cannot.*modify|már rögzített/i.test(combined)) {
       return { status: 'already_recorded', success: true, message: cleanSummary };
     }
 
-    // 3. Expired / Invalid QR or password / Closed session
     if (
       /incorrect|helytelen|hibás|invalid|expired|lejárt|nem érvényes|not allowed|nincs jogosultság|closed|lezárult/i.test(
         combined
@@ -80,8 +86,46 @@ async function inspectMoodlePageOutcome(page) {
 }
 
 /**
- * Automatically detects if Moodle redirected to a login page (/login/index.php, auth/oidc, KCA, or Microsoft account picker)
- * and clicks through KCA / Microsoft SSO using the persistent session cookies.
+ * Resolves which Moodle Attendance module (`view.php?id=...`) and Course (`course/view.php?id=...`)
+ * a given `sessid` belongs to WITHOUT submitting `qrpass`!
+ * Uses a fast background HTTP GET (`context.request.get`) with the browser's MoodleSession cookie (~100ms).
+ */
+async function resolveCourseFromSessId(moodlePage, qrUrl, sessId) {
+  if (!sessId) return null;
+  if (sessionToCourseCache.has(sessId)) {
+    return sessionToCourseCache.get(sessId);
+  }
+
+  try {
+    const parsed = new URL(qrUrl);
+    // Probe URL has ONLY sessid (qrpass is stripped so Moodle does NOT record attendance yet!)
+    const probeUrl = `${parsed.origin}${parsed.pathname}?sessid=${encodeURIComponent(sessId)}`;
+    const response = await moodlePage.context().request.get(probeUrl, { timeout: 3500 });
+    if (!response.ok()) return null;
+
+    const html = await response.text();
+    // Look for mod/attendance/view.php?id=XXXXX in breadcrumbs, form action, or cancel link
+    const attMatches = [...html.matchAll(/mod\/attendance\/view\.php\?id=(\d+)/gi)].map((m) => m[1]);
+    const courseMatches = [...html.matchAll(/course\/view\.php\?id=(\d+)/gi)].map((m) => m[1]);
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+
+    const info = {
+      attendanceId: attMatches[0] || null,
+      courseId: courseMatches[0] || null,
+      title: titleMatch ? titleMatch[1].trim() : '',
+    };
+
+    if (info.attendanceId || info.courseId) {
+      sessionToCourseCache.set(sessId, info);
+    }
+    return info;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Automatically detects if Moodle redirected to a login page and clicks through KCA / Microsoft SSO.
  */
 export async function ensureMoodleLoggedIn(page, targetUrlAfterLogin = null) {
   try {
@@ -121,7 +165,9 @@ export async function ensureMoodleLoggedIn(page, targetUrlAfterLogin = null) {
 
     if (page.url().includes('login.microsoftonline.com')) {
       await page.waitForTimeout(800);
-      const accountTile = page.locator('div[data-test-id], .table[role="button"], div.tile-container div[role="listitem"]').first();
+      const accountTile = page
+        .locator('div[data-test-id], .table[role="button"], div.tile-container div[role="listitem"]')
+        .first();
       if ((await accountTile.count()) > 0 && (await accountTile.isVisible())) {
         console.log('   -> Microsoft fiók kiválasztása...');
         await Promise.all([
@@ -130,7 +176,9 @@ export async function ensureMoodleLoggedIn(page, targetUrlAfterLogin = null) {
         ]);
       }
 
-      const staySignedInBtn = page.locator('#idSIButton9, input[type="submit"][value="Yes"], input[type="submit"][value="Igen"]').first();
+      const staySignedInBtn = page
+        .locator('#idSIButton9, input[type="submit"][value="Yes"], input[type="submit"][value="Igen"]')
+        .first();
       if ((await staySignedInBtn.count()) > 0 && (await staySignedInBtn.isVisible())) {
         console.log('   -> "Bejelentkezve marad? -> Igen" elfogadása...');
         await Promise.all([
@@ -158,7 +206,6 @@ export async function ensureMoodleLoggedIn(page, targetUrlAfterLogin = null) {
  */
 async function fillAttendanceFormIfPresent(page, code = null) {
   try {
-    // 1. Inspect what Moodle immediately returned upon opening the URL
     const initialOutcome = await inspectMoodlePageOutcome(page);
     if (initialOutcome.status === 'recorded') {
       return {
@@ -175,15 +222,15 @@ async function fillAttendanceFormIfPresent(page, code = null) {
       };
     }
 
-    // 2. Check if there is an attendance form on the page
-    const submitBtn = page.locator(
-      'input[name="submitbutton"], button[name="submitbutton"], form[action*="attendance.php"] input[type="submit"], form[action*="attendance.php"] button[type="submit"]'
-    ).first();
+    const submitBtn = page
+      .locator(
+        'input[name="submitbutton"], button[name="submitbutton"], form[action*="attendance.php"] input[type="submit"], form[action*="attendance.php"] button[type="submit"]'
+      )
+      .first();
 
     const hasForm = (await submitBtn.count()) > 0 && (await submitBtn.isVisible());
 
     if (!hasForm) {
-      // No form on page -> return the exact message Moodle showed (e.g. expired QR / error box)
       return {
         success: false,
         status: initialOutcome.status,
@@ -191,16 +238,16 @@ async function fillAttendanceFormIfPresent(page, code = null) {
       };
     }
 
-    // 3. Fill password input field if present
-    const passInput = page.locator(
-      'input[name="studentpassword"], input[name="qrpass"], input#id_studentpassword, input[type="password"], input[name*="pass" i]'
-    ).first();
+    const passInput = page
+      .locator(
+        'input[name="studentpassword"], input[name="qrpass"], input#id_studentpassword, input[type="password"], input[name*="pass" i]'
+      )
+      .first();
 
     if (code && (await passInput.count()) > 0 && (await passInput.isVisible())) {
       await passInput.fill(code);
     }
 
-    // 4. Select "Present" / "Jelen" radio option
     let radioSelected = false;
     for (const labelText of PRESENT_LABELS) {
       const label = page.locator(`label:has-text("${labelText}")`).first();
@@ -212,16 +259,15 @@ async function fillAttendanceFormIfPresent(page, code = null) {
     }
 
     if (!radioSelected) {
-      const firstStatusRadio = page.locator(
-        'input[type="radio"][name="status"], form[action*="attendance.php"] input[type="radio"]'
-      ).first();
+      const firstStatusRadio = page
+        .locator('input[type="radio"][name="status"], form[action*="attendance.php"] input[type="radio"]')
+        .first();
       if ((await firstStatusRadio.count()) > 0) {
         await firstStatusRadio.check();
         radioSelected = true;
       }
     }
 
-    // 5. Click Save and inspect Moodle's response page
     await Promise.all([
       page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {}),
       submitBtn.click(),
@@ -247,12 +293,55 @@ async function fillAttendanceFormIfPresent(page, code = null) {
 }
 
 /**
- * FAST PATH (< 1 sec): Opens a decoded QR URL in the authenticated Moodle tab and verifies Moodle's response.
+ * FAST PATH (< 1 sec) with Priority, Deduplication, and Course Schedule Verification!
  */
-export async function submitQrUrl(moodlePage, qrUrl) {
+export async function submitQrUrl(moodlePage, qrUrl, config = {}) {
+  const sessMatch = qrUrl.match(/[?&]sessid=(\d+)/i);
+  const sessId = sessMatch ? sessMatch[1] : null;
+
+  // 1. Deduplication check: if this sessid was already recorded or is currently being opened, skip immediately!
+  if (sessId && completedSessionIds.has(sessId)) {
+    console.log(
+      `⏭️ [QR DEDUPE] A(z) sessid=${sessId} órára már rögzítve van a jelenléted, további QR kód átugrása!`
+    );
+    return true;
+  }
+  if (sessId && inFlightSessionIds.has(sessId)) {
+    console.log(`⏭️ [QR DEDUPE] A(z) sessid=${sessId} megnyitása már folyamatban van, duplikált kérés átugrása!`);
+    return true;
+  }
+
+  if (sessId) inFlightSessionIds.add(sessId);
+  qrPreemptCount++;
+
   const t0 = Date.now();
-  console.log(`\n⚡ [QR-GYORSÍTÓ] Link megnyitása: ${qrUrl}`);
   try {
+    // 2. If `course_schedules` is configured, resolve which course `sessid` belongs to BEFORE opening `qrpass`!
+    if (
+      sessId &&
+      config.course_schedules &&
+      Object.keys(config.course_schedules).length > 0
+    ) {
+      const courseInfo = await resolveCourseFromSessId(moodlePage, qrUrl, sessId);
+      if (courseInfo && (courseInfo.attendanceId || courseInfo.courseId)) {
+        const checkId = courseInfo.attendanceId || courseInfo.courseId;
+        const courseCheck = checkCourseSchedule(config, checkId);
+        if (!courseCheck.allowed) {
+          console.log(
+            `\n🛑 [QR SKIPPELVE - MÁS CSOPORT ÓRÁJA!] sessid=${sessId} -> Tárgy ID: ${checkId} (${
+              courseInfo.title || ''
+            })\n   Indok: ${courseCheck.reason}`
+          );
+          // Mark sessId as handled so subsequent QR photos from that other group's class are also ignored in 0ms
+          completedSessionIds.add(sessId);
+          return false;
+        } else if (courseCheck.courseName) {
+          console.log(`✅ [CSOPORT ELLENŐRZÉS OK] ${courseCheck.reason}`);
+        }
+      }
+    }
+
+    console.log(`\n⚡ [QR-GYORSÍTÓ] Link megnyitása: ${qrUrl}`);
     await moodlePage.goto(qrUrl, { waitUntil: 'domcontentloaded', timeout: 8000 });
     await ensureMoodleLoggedIn(moodlePage, qrUrl);
 
@@ -263,8 +352,10 @@ export async function submitQrUrl(moodlePage, qrUrl) {
     const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
 
     if (res.status === 'already_recorded') {
+      if (sessId) completedSessionIds.add(sessId);
       console.log(`ℹ️ [QR Megerősítve - ${elapsed}s] ${res.detail}`);
     } else if (res.success) {
+      if (sessId) completedSessionIds.add(sessId);
       console.log(`✅ [QR SIKER - ${elapsed}s] ${res.detail}`);
     } else {
       console.warn(`⚠️ [QR ELUTASÍTVA / HIBA - ${elapsed}s] ${res.detail}`);
@@ -273,11 +364,15 @@ export async function submitQrUrl(moodlePage, qrUrl) {
   } catch (err) {
     console.error(`❌ [QR HIBA] Nem sikerült megnyitni a QR linket: ${err.message}`);
     return false;
+  } finally {
+    if (sessId) inFlightSessionIds.delete(sessId);
+    qrPreemptCount = Math.max(0, qrPreemptCount - 1);
   }
 }
 
 /**
- * 6-CHAR CODE PATH: Loops through all configured attendance_urls to find the active "Submit attendance" button.
+ * 6-CHAR CODE PATH: Loops through configured attendance_urls (skipping courses outside their `course_schedules` window!).
+ * Automatically yields/pauses if a high-priority QR code arrives mid-scan!
  */
 export async function submitSixCharCodeAcrossLinks(moodlePage, code, config) {
   const urls = (config.attendance_urls || []).filter(
@@ -295,11 +390,33 @@ export async function submitSixCharCodeAcrossLinks(moodlePage, code, config) {
   const retryWaitMs = (config.retry_if_not_open_seconds || 20) * 1000;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Filter out courses that have a restricted group schedule in `course_schedules` and aren't currently active
+    const eligibleUrls = [];
+    for (const u of urls) {
+      const check = checkCourseSchedule(config, u);
+      if (check.allowed) {
+        eligibleUrls.push(u);
+      } else if (attempt === 1) {
+        console.log(`⏭️ [TÁRGY KIHAGYVA] ${u} -> ${check.reason}`);
+      }
+    }
+
+    if (eligibleUrls.length === 0) {
+      console.log(`⏸️ [NINCS AKTÍV TÁRGY] Jelenleg egyik tárgyad sincs a megengedett csoport-idősávban.`);
+      return false;
+    }
+
     console.log(
-      `\n🔍 [KÓD KERESÉS #${attempt}/${maxAttempts}] "${code}" próbálása ${urls.length} tárgy linken...`
+      `\n🔍 [KÓD KERESÉS #${attempt}/${maxAttempts}] "${code}" próbálása ${eligibleUrls.length} tárgy linken...`
     );
 
-    for (const courseUrl of urls) {
+    for (const courseUrl of eligibleUrls) {
+      // Yield immediately if a fast QR code arrived!
+      while (isQrRunning()) {
+        console.log('⚡ [PRIORITÁS] 6-jegyű kód keresés szüneteltetése, amíg a QR-kód lefut...');
+        await new Promise((r) => setTimeout(r, 400));
+      }
+
       try {
         await moodlePage.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: 10000 });
         await ensureMoodleLoggedIn(moodlePage, courseUrl);
@@ -315,6 +432,14 @@ export async function submitSixCharCodeAcrossLinks(moodlePage, code, config) {
 
         if (submitLink) {
           const href = await submitLink.getAttribute('href');
+          const sessMatch = href?.match(/[?&]sessid=(\d+)/i);
+          const sessId = sessMatch ? sessMatch[1] : null;
+
+          if (sessId && completedSessionIds.has(sessId)) {
+            console.log(`ℹ️ [MÁR RÖGZÍTVE] A(z) ${courseUrl} (sessid=${sessId}) órára már be vagy írva!`);
+            return true;
+          }
+
           console.log(`🎯 [TALÁLAT] Aktív jelenlét űrlap megtalálva itt: ${courseUrl}`);
 
           await Promise.all([
@@ -324,6 +449,7 @@ export async function submitSixCharCodeAcrossLinks(moodlePage, code, config) {
 
           const res = await fillAttendanceFormIfPresent(moodlePage, code);
           if (res.success) {
+            if (sessId) completedSessionIds.add(sessId);
             console.log(`🎉 [SIKER] "${code}" -> ${res.detail}`);
             return true;
           } else {

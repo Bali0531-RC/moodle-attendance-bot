@@ -27,5 +27,14 @@
     "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=111111",
     "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=222222",
     "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=333333"
-  ]
+  ],
+  "course_schedules": {
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=222222": {
+      "name": "Programozás 1 gyakorlat (Opcionális: csak a saját csoportom idősávjában fogadja el a QR-t!)",
+      "buffer_before_minutes": 10,
+      "windows": [
+        { "day": "Wednesday", "start": "08:00", "end": "10:00" }
+      ]
+    }
+  }
 }
