@@ -1,0 +1,16 @@
+services:
+  moodle-attendance-bot:
+    build: .
+    container_name: moodle-attendance-bot
+    restart: unless-stopped
+    shm_size: '1gb'
+    environment:
+      - TZ=Europe/Budapest
+      - HEADLESS=true
+    env_file:
+      - .env
+    volumes:
+      - ./config.json:/app/config.json
+      - ./.browser-profile:/app/.browser-profile
+      - ./auth.json:/app/auth.json
+      - ./.copilot-token.json:/app/.copilot-token.json

@@ -1,0 +1,33 @@
+{
+  "messenger_group_url": "https://www.messenger.com/t/2238907013319198",
+  "moodle_base_url": "https://moodle.uni-pannon.hu",
+  "headless": false,
+  "keep_alive_minutes": 10,
+  "retry_if_not_open_seconds": 20,
+  "retry_max_attempts": 35,
+  "timezone": "Europe/Budapest",
+  "active_schedule": {
+    "Monday": [
+      { "start": "09:30", "end": "12:00" }
+    ],
+    "Tuesday": [
+      { "start": "07:30", "end": "14:00" }
+    ],
+    "Wednesday": [
+      { "start": "07:30", "end": "12:00" }
+    ],
+    "Thursday": [
+      { "start": "09:30", "end": "16:00" }
+    ],
+    "Friday": [],
+    "Saturday": [],
+    "Sunday": []
+  },
+  "attendance_urls": [
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=596153",
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=586640",
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=576818",
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=596165",
+    "https://moodle.uni-pannon.hu/mod/attendance/view.php?id=610847"
+  ]
+}

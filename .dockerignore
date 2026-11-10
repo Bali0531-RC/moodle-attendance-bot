@@ -1,0 +1,7 @@
+node_modules
+.browser-profile
+auth.json
+.copilot-token.json
+.env
+.git
+*.log
