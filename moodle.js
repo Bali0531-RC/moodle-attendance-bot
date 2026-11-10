@@ -104,14 +104,17 @@ async function resolveCourseFromSessId(moodlePage, qrUrl, sessId) {
     if (!response.ok()) return null;
 
     const html = await response.text();
-    // Look for mod/attendance/view.php?id=XXXXX in breadcrumbs, form action, or cancel link
+    // 1. Extract from Moodle's embedded M.cfg JSON (`contextInstanceId` is ALWAYS the exact `mod/attendance/view.php?id=...`!)
+    const cfgInstMatch = html.match(/"contextInstanceId"\s*:\s*(\d+)/);
+    const cfgCourseMatch = html.match(/"courseId"\s*:\s*(\d+)/);
+    // 2. Fallback: look for mod/attendance/view.php?id=XXXXX in breadcrumbs, form action, or cancel link
     const attMatches = [...html.matchAll(/mod\/attendance\/view\.php\?id=(\d+)/gi)].map((m) => m[1]);
     const courseMatches = [...html.matchAll(/course\/view\.php\?id=(\d+)/gi)].map((m) => m[1]);
     const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
 
     const info = {
-      attendanceId: attMatches[0] || null,
-      courseId: courseMatches[0] || null,
+      attendanceId: cfgInstMatch ? cfgInstMatch[1] : attMatches[0] || null,
+      courseId: cfgCourseMatch ? cfgCourseMatch[1] : courseMatches[0] || null,
       title: titleMatch ? titleMatch[1].trim() : '',
     };
 
@@ -316,27 +319,47 @@ export async function submitQrUrl(moodlePage, qrUrl, config = {}) {
 
   const t0 = Date.now();
   try {
-    // 2. If `course_schedules` is configured, resolve which course `sessid` belongs to BEFORE opening `qrpass`!
-    if (
-      sessId &&
-      config.course_schedules &&
-      Object.keys(config.course_schedules).length > 0
-    ) {
-      const courseInfo = await resolveCourseFromSessId(moodlePage, qrUrl, sessId);
-      if (courseInfo && (courseInfo.attendanceId || courseInfo.courseId)) {
-        const checkId = courseInfo.attendanceId || courseInfo.courseId;
-        const courseCheck = checkCourseSchedule(config, checkId);
-        if (!courseCheck.allowed) {
-          console.log(
-            `\n🛑 [QR SKIPPELVE - MÁS CSOPORT ÓRÁJA!] sessid=${sessId} -> Tárgy ID: ${checkId} (${
-              courseInfo.title || ''
-            })\n   Indok: ${courseCheck.reason}`
-          );
-          // Mark sessId as handled so subsequent QR photos from that other group's class are also ignored in 0ms
-          completedSessionIds.add(sessId);
-          return false;
-        } else if (courseCheck.courseName) {
-          console.log(`✅ [CSOPORT ELLENŐRZÉS OK] ${courseCheck.reason}`);
+    // 2. Verify via `sessid` that:
+    //    a) The QR belongs to one of the user's configured `attendance_urls` (prevents submitting attendance for pre-completed courses like Prog 1!)
+    //    b) If the course has `course_schedules` restrictions, we are currently inside the user's group time window!
+    if (sessId) {
+      const configuredIds = new Set(
+        (config.attendance_urls || [])
+          .filter((u) => u && !u.includes('moodle.egyetem.hu'))
+          .map((u) => u.match(/[?&]id=(\d+)/i)?.[1])
+          .filter(Boolean)
+      );
+      const hasCourseSchedules =
+        config.course_schedules && Object.keys(config.course_schedules).length > 0;
+
+      if (configuredIds.size > 0 || hasCourseSchedules) {
+        const courseInfo = await resolveCourseFromSessId(moodlePage, qrUrl, sessId);
+        if (courseInfo && (courseInfo.attendanceId || courseInfo.courseId)) {
+          const attId = courseInfo.attendanceId;
+          const checkId = attId || courseInfo.courseId;
+
+          // 2/A: Check if this QR's attendance module ID is even in the user's `attendance_urls` list!
+          if (configuredIds.size > 0 && attId && !configuredIds.has(String(attId))) {
+            console.log(
+              `\n🛑 [QR SKIPPELVE - NINCS A TÁRGYAID KÖZÖTT!] sessid=${sessId} -> Attendance ID: ${attId} (Course ID: ${courseInfo.courseId})\n   Indok: Ez a tárgy nincs benne az attendance_urls listádban (pl. előteljesített / nem felvett tárgy)!`
+            );
+            completedSessionIds.add(sessId);
+            return false;
+          }
+
+          // 2/B: Check `course_schedules` (including A/B week exact dates & -10 min pre-class buffer)
+          if (hasCourseSchedules) {
+            const courseCheck = checkCourseSchedule(config, checkId);
+            if (!courseCheck.allowed) {
+              console.log(
+                `\n🛑 [QR SKIPPELVE - MÁS CSOPORT ÓRÁJA!] sessid=${sessId} -> Tárgy ID: ${checkId}\n   Indok: ${courseCheck.reason}`
+              );
+              completedSessionIds.add(sessId);
+              return false;
+            } else if (courseCheck.courseName) {
+              console.log(`✅ [CSOPORT ELLENŐRZÉS OK] ${courseCheck.reason}`);
+            }
+          }
         }
       }
     }

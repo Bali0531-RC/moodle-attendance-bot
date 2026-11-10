@@ -4,6 +4,7 @@ auth.json
 config.json
 .copilot-token.json
 .passkeys.json
+.neptun-calendar.ics
 .env
 *.log
 .DS_Store

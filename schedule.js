@@ -24,21 +24,26 @@ function parseTimeToMinutes(hhmm) {
 
 function getCurrentTimeParts(config, now = new Date()) {
   const timeZone = config.timezone || 'Europe/Budapest';
-  const parts = new Intl.DateTimeFormat('en-US', {
+  const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
     weekday: 'long',
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
   }).formatToParts(now);
 
-  const weekdayRaw = parts.find((p) => p.type === 'weekday')?.value || 'Monday';
-  const hourStr = parts.find((p) => p.type === 'hour')?.value || '00';
-  const minuteStr = parts.find((p) => p.type === 'minute')?.value || '00';
-  const currentTime = `${hourStr === '24' ? '00' : hourStr}:${minuteStr}`;
+  const get = (t) => parts.find((p) => p.type === t)?.value || '';
+  const dateStr = `${get('year')}-${get('month')}-${get('day')}`;
+  const weekdayRaw = get('weekday') || 'Monday';
+  const hourStr = get('hour') === '24' ? '00' : get('hour') || '00';
+  const minuteStr = get('minute') || '00';
+  const currentTime = `${hourStr}:${minuteStr}`;
   const currentMinutes = parseTimeToMinutes(currentTime);
 
-  return { weekdayRaw, currentTime, currentMinutes };
+  return { dateStr, weekdayRaw, currentTime, currentMinutes };
 }
 
 /**
@@ -156,12 +161,17 @@ export function checkCourseSchedule(config, courseIdentifier, now = new Date()) 
     return { allowed: true, courseName, reason: `${courseName}: üres idősáv lista (mindig engedélyezve)` };
   }
 
-  const { weekdayRaw, currentTime, currentMinutes } = getCurrentTimeParts(config, now);
+  const { dateStr, weekdayRaw, currentTime, currentMinutes } = getCurrentTimeParts(config, now);
 
   for (const win of windows) {
     if (!win.day || !win.start || !win.end) continue;
     const normDay = DAY_MAP[String(win.day).toLowerCase().trim()] || win.day;
     if (normDay.toLowerCase() !== weekdayRaw.toLowerCase()) continue;
+
+    // A/B week support: if exact dates array is specified on the window, verify today's YYYY-MM-DD is in it!
+    if (Array.isArray(win.dates) && win.dates.length > 0 && !win.dates.includes(dateStr)) {
+      continue;
+    }
 
     const startMin = parseTimeToMinutes(win.start) - bufferBefore;
     const endMin = parseTimeToMinutes(win.end);

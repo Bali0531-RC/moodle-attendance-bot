@@ -8,6 +8,7 @@ import { extractSixCharCode, getAiCredentials, loginGitHubCopilotDeviceFlow } fr
 import { ensureMoodleLoggedIn, submitQrUrl, submitSixCharCodeAcrossLinks } from './moodle.js';
 import { checkActiveSchedule } from './schedule.js';
 import { attachVirtualPasskeyAuthenticator, loadSavedPasskeys } from './passkey.js';
+import { syncNeptunIcsToConfig } from './sync-ics.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = fs.existsSync(path.join(__dirname, 'config.json'))
@@ -423,6 +424,7 @@ function startInteractiveCli(context, messengerPage, moodlePage, passkeyManager)
   }
 
   console.log('Parancsok a terminálban:');
+  console.log('  • sync-ics [neptun_ics_url]           -> Neptun .ics órarend (A/B hét) importálása a config.json-ba!');
   console.log('  • passkey-register                    -> Megnyitja a Facebook Passkey beállítást új kulcs regisztrálásához!');
   console.log('  • passkey-list                        -> Kilistázza az elmentett virtuális Passkey-eket (.passkeys.json)');
   console.log('  • save                                -> Kimenti az auth.json-t és a Passkey-eket szerverre költöztetéshez');
@@ -441,6 +443,16 @@ function startInteractiveCli(context, messengerPage, moodlePage, passkeyManager)
   rl.on('line', async (line) => {
     const input = line.trim();
     if (!input) return;
+
+    if (input === 'sync-ics' || input.startsWith('sync-ics ')) {
+      const argUrl = input.slice(8).trim() || undefined;
+      try {
+        config = await syncNeptunIcsToConfig(argUrl);
+      } catch (err) {
+        console.error(`❌ [ICS HIBA] ${err.message}`);
+      }
+      return;
+    }
 
     if (input === 'passkey-register') {
       console.log('🔑 Facebook Accounts Center (Passkey/Jelkulcs létrehozás) megnyitása az 1. fülön...');

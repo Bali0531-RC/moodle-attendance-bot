@@ -90,6 +90,18 @@ Szerkeszd a **`config.json`** fájlt:
 - **`course_schedules` (Opcionális, több gyakorlati csoportos tárgyakhoz!):** Ha egy tárgyból több gyakorlati csoport van a héten és más csoportok is beküldik a közös Messengerbe a QR-kódjukat, itt megadhatod a tárgy `view.php?id=...` linkjéhez a **saját csoportod** pontos idősávját (`buffer_before_minutes: 10` perces óra előtti tűréssel).
   - Amikor bejön egy QR-kód (`...attendance.php?qrpass=...&sessid=5303`), a bot először **levágja róla a `qrpass`-t**, és ~100ms alatt megnézi, melyik tárgyhoz tartozik a `sessid=5303`. Ha a tárgy szerepel a `course_schedules`-ben, és épp nincs (és 10 percen belül sem lesz) belőle órád, **nem küldi be a jelenlétet** (`🛑 [QR SKIPPELVE - MÁS CSOPORT ÓRÁJA!]`)!
   - Ugyanerre a `sessid`-re érkező további QR fotókat automatikusan deduplikálja (`⏭️ [QR DEDUPE]`), és a QR-kódok mindig elsőbbséget élveznek a 6-jegyű kód kereséssel szemben.
+  - **Előteljesített / kihagyott tárgyak védelme:** Ha egy QR-kód olyan tárgyhoz tartozik, aminek a `view.php?id=...` linkje nincs benne a te `attendance_urls` listádban (mert pl. előteljesítetted), a bot a `sessid` ellenőrzésekor (`contextInstanceId`) azonnal eldobja (`🛑 [QR SKIPPELVE - NINCS A TÁRGYAID KÖZÖTT!]`).
+
+### 📅 Neptun Órarend (`.ics`) Automatikus Importálása (A/B hetes támogatással!)
+Nem kell kézzel beírogatnod az órarendet! A Neptunból kimásolt **Naptár szinkronizációs (`.ics`) linkkel** egyetlen paranccsal kitöltheted az `active_schedule` és a `course_schedules` szekciókat:
+
+```bash
+pnpm run sync-ics "https://neptun-ws01.uni-pannon.hu/hallgato/api/Calendar/CalendarExportFileToSyncronization?id=...ics"
+```
+*(Vagy a futó bot termináljába beírva: `sync-ics https://...ics`)*
+- A script letölti a Neptun `.ics` naptáradat, összepárosítja a Moodle `attendance_urls` tárgyaiddal (amik nincsenek benne az `attendance_urls`-ben, azokat automatikusan kihagyja!),
+- Felismeri az **A/B hetes (kéthetes) órákat** és eltárolja a pontos dátumaikat (`dates: ["2026-09-10", ...]`),
+- Majd automatikusan frissíti a `config.json`-t!
 
 Szerkeszd a **`.env`** fájlt:
 ```ini
