@@ -5,14 +5,20 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PASSKEYS_FILE = path.join(__dirname, '.passkeys.json');
 
+const attachedPages = new WeakSet();
+const activeAdapters = [];
+
 /**
- * Attaches a Chromium CDP Virtual FIDO2/CTAP2 Passkey Authenticator to the given page.
+ * Attaches a Chromium CDP Virtual FIDO2/CTAP2 Passkey Authenticator to a Page (and automatically to any new tabs opened in the Context).
  * - Automatically intercepts any WebAuthn Passkey registration (`navigator.credentials.create`)
  *   and saves the private key to `.passkeys.json`.
  * - Automatically signs any WebAuthn Passkey login challenge (`navigator.credentials.get`)
  *   in 0ms without any OS popup or human interaction (`automaticPresenceSimulation: true, isUserVerified: true`).
  */
-export async function attachVirtualPasskeyAuthenticator(page) {
+export async function attachVirtualPasskeyToPage(page) {
+  if (attachedPages.has(page)) return;
+  attachedPages.add(page);
+
   try {
     const cdp = await page.context().newCDPSession(page);
     await cdp.send('WebAuthn.enable', { enableUI: false });
@@ -21,36 +27,24 @@ export async function attachVirtualPasskeyAuthenticator(page) {
       options: {
         protocol: 'ctap2',
         ctap2Version: 'ctap2_1',
-        transport: 'internal', // Platform authenticator (acts like built-in TouchID / Windows Hello / Android Passkey)
-        hasResidentKey: true,  // Supports discoverable Passkeys
+        transport: 'internal', // Platform authenticator (TouchID / Windows Hello / Built-in Passkey)
+        hasResidentKey: true,
         hasUserVerification: true,
-        isUserVerified: true,  // Always passes biometric/PIN verification automatically
-        automaticPresenceSimulation: true, // Automatically approves without user prompt
+        isUserVerified: true,
+        automaticPresenceSimulation: true,
       },
     });
 
-    // Load previously saved passkeys from .passkeys.json into this virtual authenticator
     const saved = loadSavedPasskeys();
-    let loadedCount = 0;
     for (const cred of saved) {
       try {
         await cdp.send('WebAuthn.addCredential', {
           authenticatorId,
           credential: cred,
         });
-        loadedCount++;
-      } catch (err) {
-        console.warn(`⚠️ [PASSKEY] Nem sikerült betölteni egy mentett kulcsot (${cred.rpId}): ${err.message}`);
-      }
+      } catch {}
     }
 
-    if (loadedCount > 0) {
-      console.log(`🔑 [VIRTUAL PASSKEY] ${loadedCount} db mentett Passkey betöltve (.passkeys.json) -> 0ms auto-2FA aktív!`);
-    } else {
-      console.log('🔑 [VIRTUAL PASSKEY] Virtuális FIDO2 Passkey modul aktív (új Passkey regisztrációra kész)!');
-    }
-
-    // Listen for newly registered passkeys and save them immediately
     cdp.on('WebAuthn.credentialAdded', async () => {
       await syncPasskeysToFile(cdp, authenticatorId);
       console.log('🎉 [PASSKEY REGISZTRÁLVA!] Új Passkey sikeresen elkapva és elmentve a .passkeys.json fájlba!');
@@ -61,11 +55,43 @@ export async function attachVirtualPasskeyAuthenticator(page) {
       syncPasskeysToFile(cdp, authenticatorId).catch(() => {});
     });
 
-    return { cdp, authenticatorId, sync: () => syncPasskeysToFile(cdp, authenticatorId) };
+    activeAdapters.push({ cdp, authenticatorId });
+    return { cdp, authenticatorId };
   } catch (err) {
     console.warn(`⚠️ [VIRTUAL PASSKEY HIBA] Nem sikerült aktiválni a CDP WebAuthn modult: ${err.message}`);
     return null;
   }
+}
+
+export async function attachVirtualPasskeyAuthenticator(contextOrPage) {
+  const context = typeof contextOrPage.pages === 'function' ? contextOrPage : contextOrPage.context();
+
+  // Attach to all currently open tabs
+  for (const p of context.pages()) {
+    await attachVirtualPasskeyToPage(p);
+  }
+
+  // Automatically attach to any newly opened tab / popup!
+  context.on('page', (newPage) => {
+    attachVirtualPasskeyToPage(newPage).catch(() => {});
+  });
+
+  const saved = loadSavedPasskeys();
+  if (saved.length > 0) {
+    console.log(
+      `🔑 [VIRTUAL PASSKEY] ${saved.length} db mentett Passkey betöltve minden fülre (.passkeys.json) -> 0ms auto-2FA aktív!`
+    );
+  } else {
+    console.log('🔑 [VIRTUAL PASSKEY] Virtuális FIDO2 Passkey modul aktív minden fülön (új Passkey regisztrációra kész)!');
+  }
+
+  return {
+    sync: async () => {
+      for (const { cdp, authenticatorId } of activeAdapters) {
+        await syncPasskeysToFile(cdp, authenticatorId);
+      }
+    },
+  };
 }
 
 export function loadSavedPasskeys() {
@@ -82,11 +108,16 @@ export async function syncPasskeysToFile(cdp, authenticatorId) {
   try {
     const { credentials } = await cdp.send('WebAuthn.getCredentials', { authenticatorId });
     if (Array.isArray(credentials) && credentials.length > 0) {
-      fs.writeFileSync(PASSKEYS_FILE, JSON.stringify(credentials, null, 2));
-      return credentials;
+      // Merge with existing by credentialId
+      const existing = loadSavedPasskeys();
+      const map = new Map(existing.map((c) => [c.credentialId, c]));
+      for (const c of credentials) {
+        map.set(c.credentialId, c);
+      }
+      const merged = [...map.values()];
+      fs.writeFileSync(PASSKEYS_FILE, JSON.stringify(merged, null, 2));
+      return merged;
     }
-  } catch (err) {
-    console.warn(`⚠️ [PASSKEY MENTÉS HIBA] ${err.message}`);
-  }
+  } catch {}
   return [];
 }

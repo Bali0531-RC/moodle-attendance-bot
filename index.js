@@ -441,9 +441,10 @@ function startInteractiveCli(context, messengerPage, moodlePage, passkeyManager)
     if (!input) return;
 
     if (input === 'passkey-register') {
-      console.log('🔑 Facebook Accounts Center (Passkey/Jelkulcs létrehozás) megnyitása a Messenger fülön...');
-      console.log('👉 Kattints a böngészőben a "Passkey / Jelkulcs" -> "Create passkey / Jelkulcs létrehozása" gombra!');
-      console.log('👉 A bot virtuális FIDO2 chipje automatikusan elkapja és elmenti a .passkeys.json fájlba!');
+      console.log('🔑 Facebook Accounts Center (Passkey/Jelkulcs létrehozás) megnyitása az 1. fülön...');
+      console.log('👉 Ha a Meta biztonsági ellenőrzést kér előtte (pl. meglévő Passkey QR kód), nyomj a "Cancel" -> "Próbálkozás másik módszerrel" (jelszó) gombra!');
+      console.log('👉 Utána kattints a "Create passkey / Jelkulcs létrehozása" gombra, és a bot azonnal elmenti a .passkeys.json-ba!');
+      await messengerPage.bringToFront().catch(() => {});
       await messengerPage.goto('https://accountscenter.facebook.com/password_and_security/passkeys', {
         waitUntil: 'domcontentloaded',
       }).catch(() => {});
@@ -542,8 +543,8 @@ async function main() {
   const messengerPage = pages[0] || (await context.newPage());
   const moodlePage = pages[1] || (await context.newPage());
 
-  // Attach Chromium CDP Virtual FIDO2 Passkey Authenticator to Messenger tab
-  const passkeyManager = await attachVirtualPasskeyAuthenticator(messengerPage);
+  // Attach Chromium CDP Virtual FIDO2 Passkey Authenticator to ALL tabs (existing and newly opened!)
+  const passkeyManager = await attachVirtualPasskeyAuthenticator(context);
 
   await attachMessengerObserver(context, messengerPage, moodlePage);
 
