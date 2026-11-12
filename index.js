@@ -33,7 +33,8 @@ fs.watchFile(CONFIG_PATH, () => {
 const processedTexts = new Set();
 const processedImageUrls = new Set();
 const recentChatHistory = [];
-let activeSubmissionPromise = null;
+let activeSubmissionPromise = Promise.resolve();
+let sixCharActiveCount = 0;
 
 /**
  * Checks if the context actually has a logged-in Messenger user cookie (c_user + xs)
@@ -54,7 +55,7 @@ async function hasValidMessengerSession(context) {
  * Detects if Messenger tab is logged out, asking for "Continue as...", or asking for the 6-digit E2EE PIN.
  * Automatically recovers if possible or logs a clear alert!
  */
-export async function checkAndRecoverMessengerSession(context, messengerPage) {
+export async function checkAndRecoverMessengerSession(context, messengerPage, verbose = true) {
   try {
     const url = messengerPage.url();
     const cookiesValid = await hasValidMessengerSession(context);
@@ -150,7 +151,7 @@ export async function checkAndRecoverMessengerSession(context, messengerPage) {
     }
 
     const finalValid = await hasValidMessengerSession(context);
-    if (finalValid) {
+    if (finalValid && verbose) {
       console.log('✅ [MESSENGER STATUS] Session aktív (c_user & xs sütik érvényesek)!');
     }
     return finalValid;
@@ -315,9 +316,13 @@ async function onNewChatMessage(moodlePage, text, bypassSchedule = false) {
 }
 
 function triggerSixCharSubmission(moodlePage, code) {
-  activeSubmissionPromise = Promise.resolve(activeSubmissionPromise).then(() =>
-    submitSixCharCodeAcrossLinks(moodlePage, code, config)
-  );
+  sixCharActiveCount++;
+  activeSubmissionPromise = activeSubmissionPromise
+    .then(() => submitSixCharCodeAcrossLinks(moodlePage, code, config))
+    .catch((err) => console.error(`[6-JEGYŰ HIBA] ${err.message}`))
+    .finally(() => {
+      sixCharActiveCount = Math.max(0, sixCharActiveCount - 1);
+    });
 }
 
 /**
@@ -567,27 +572,28 @@ async function main() {
   await messengerPage.waitForTimeout(2500);
   await checkAndRecoverMessengerSession(context, messengerPage);
 
-  console.log(`🎓 Moodle megnyitása: ${config.moodle_base_url}`);
-  await moodlePage.goto(config.moodle_base_url, { waitUntil: 'domcontentloaded' }).catch(() => {});
-  await ensureMoodleLoggedIn(moodlePage, config.moodle_base_url);
+  const moodleKeepAliveUrl = new URL('/my/', config.moodle_base_url).href;
+  console.log(`🎓 Moodle megnyitása: ${moodleKeepAliveUrl}`);
+  await moodlePage.goto(moodleKeepAliveUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  await ensureMoodleLoggedIn(moodlePage, moodleKeepAliveUrl);
 
   setTimeout(() => savePortableAuthState(context), 15000);
 
-  // Periodic health check on Messenger (every 2 minutes) + Moodle/KCA keep-alive (every 10 minutes)
+  // Silent periodic health check on Messenger (every 2 minutes) + Moodle/KCA keep-alive (every 10 minutes)
   setInterval(async () => {
     try {
-      await checkAndRecoverMessengerSession(context, messengerPage);
+      await checkAndRecoverMessengerSession(context, messengerPage, false);
     } catch {}
   }, 2 * 60 * 1000);
 
   const keepAliveMs = (config.keep_alive_minutes || 10) * 60 * 1000;
   setInterval(async () => {
     try {
-      if (!activeSubmissionPromise) {
-        console.log('🔄 [KEEP-ALIVE] Moodle, KCA & Messenger session ellenőrzése...');
-        await checkAndRecoverMessengerSession(context, messengerPage);
-        await moodlePage.goto(config.moodle_base_url, { waitUntil: 'domcontentloaded', timeout: 12000 });
-        await ensureMoodleLoggedIn(moodlePage, config.moodle_base_url);
+      if (sixCharActiveCount === 0) {
+        console.log('🔄 [KEEP-ALIVE] Moodle (/my/), KCA & Messenger session frissítése...');
+        await checkAndRecoverMessengerSession(context, messengerPage, true);
+        await moodlePage.goto(moodleKeepAliveUrl, { waitUntil: 'domcontentloaded', timeout: 12000 });
+        await ensureMoodleLoggedIn(moodlePage, moodleKeepAliveUrl);
         await savePortableAuthState(context);
       }
     } catch {}

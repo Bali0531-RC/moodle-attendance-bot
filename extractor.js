@@ -108,8 +108,9 @@ export async function extractSixCharCode(messageText, recentMessages = []) {
   // Ignore URLs
   if (/^https?:\/\//i.test(clean)) return null;
 
-  // 1. Direct single-token message: e.g. "x7b9k2" or "AB12CD" (0ms, no AI call wasted)
-  if (/^[A-Za-z0-9]{6}$/.test(clean)) {
+  // 1. Direct single-token message: ONLY skip AI if it contains at least one digit or uppercase letter (e.g. "ic7uoe", "X7B9K2")
+  // Pure lowercase 6-letter words (like "hupszi", "amugy", "persze") fall through to Copilot AI so normal chat words aren't mistaken for codes!
+  if (/^[A-Za-z0-9]{6}$/.test(clean) && (/\d/.test(clean) || /[A-Z]/.test(clean))) {
     if (!STOPWORDS.has(clean.toLowerCase())) {
       return clean;
     }

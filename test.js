@@ -15,16 +15,18 @@ import { checkActiveSchedule, checkCourseSchedule } from './schedule.js';
 async function runSelfTest() {
   console.log('🧪 1. TESZT: 6-jegyű kód kinyerés (Regex + GitHub Copilot AI)...');
   const cases = [
-    { msg: 'X7B9K2', expected: 'X7B9K2' },
-    { msg: 'a mai kód: ab12cd', expected: 'ab12cd' },
-    { msg: 'sziasztok valaki küldte már?', expected: null },
-    { msg: 'beírták táblára: 9k4m2p', expected: '9k4m2p' },
-    { msg: 'srácok a táblára felírták hogy m8p4k1 siessetek', expected: 'm8p4k1' },
-    { msg: 'ma délután megyek boltba venni kenyeret', expected: null },
+    { msg: 'X7B9K2', context: [], expected: 'X7B9K2' },
+    { msg: 'ic7uoe', context: [], expected: 'ic7uoe' },
+    { msg: 'a mai kód: ab12cd', context: [], expected: 'ab12cd' },
+    { msg: 'sziasztok valaki küldte már?', context: [], expected: null },
+    { msg: 'hupszi', context: ['ez prog1 lett'], expected: null },
+    { msg: 'beírták táblára: 9k4m2p', context: [], expected: '9k4m2p' },
+    { msg: 'srácok a táblára felírták hogy m8p4k1 siessetek', context: [], expected: 'm8p4k1' },
+    { msg: 'ma délután megyek boltba venni kenyeret', context: [], expected: null },
   ];
 
   for (const c of cases) {
-    const got = await extractSixCharCode(c.msg, []);
+    const got = await extractSixCharCode(c.msg, c.context);
     console.log(`   Üzenet: "${c.msg}" -> Kinyert: ${got} (Várt: ${c.expected})`);
     if (got !== c.expected) throw new Error(`Kód kinyerési hiba: ${got} !== ${c.expected}`);
   }
@@ -93,7 +95,12 @@ async function runSelfTest() {
         return;
       }
 
-      // If sessid=5303 (e.g. Prog 1 other group's session), return breadcrumb linking to view.php?id=586640
+      // Simulate Moodle returning HTTP 404 exception page with M.cfg.contextInstanceId when qrpass is stripped!
+      if (sessid === '5309') {
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<html><head><title>Hiba | PE e-learning</title><script>var M = { cfg: { "courseId": 36690, "contextInstanceId": 562883 } };</script></head><body>Hiba</body></html>`);
+        return;
+      }
       const courseViewId = sessid === '5303' ? '586640' : '44444';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`
@@ -207,7 +214,16 @@ async function runSelfTest() {
     if (rejected !== false || submittedFormData !== null) {
       throw new Error('Course schedule szűrés hiba: nem tiltotta le a másik csoport QR kódját!');
     }
-    console.log('✅ QR kód dekódolás, sessid deduplikáció és más csoport QR kiszűrése (course_schedules) hibátlan!');
+    // Test HTTP 404 Moodle exception page + strict `attendance_urls` whitelist rejection (e.g. sessid=5309 -> Prog 1 ID 562883 not in attendance_urls)
+    const whitelistRejected = await submitQrUrl(
+      page,
+      `${base}/mod/attendance/attendance.php?sessid=5309&qrpass=FASTQR`,
+      { attendance_urls: [`${base}/mod/attendance/view.php?id=596153`] }
+    );
+    if (whitelistRejected !== false || submittedFormData !== null) {
+      throw new Error('Whitelist szűrés hiba: nem tiltotta le az előteljesített tárgyat (sessid=5309)!');
+    }
+    console.log('✅ QR kód dekódolás, sessid deduplikáció, 404 M.cfg feloldás és előteljesített/más csoport QR kiszűrése hibátlan!');
   } finally {
     await browser.close();
     server.close();

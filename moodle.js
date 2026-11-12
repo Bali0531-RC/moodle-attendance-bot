@@ -85,10 +85,34 @@ async function inspectMoodlePageOutcome(page) {
   }
 }
 
+function parseCourseInfoFromHtml(html) {
+  if (!html) return null;
+  const cfgInstMatch = html.match(/"contextInstanceId"\s*:\s*(\d+)/);
+  const cfgCourseMatch = html.match(/"courseId"\s*:\s*(\d+)/);
+  const attMatches = [...html.matchAll(/mod\/attendance\/view\.php\?id=(\d+)/gi)].map((m) => m[1]);
+  const courseMatches = [...html.matchAll(/course\/view\.php\?id=(\d+)/gi)].map((m) => m[1]);
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+
+  const rawAttId = cfgInstMatch && cfgInstMatch[1] !== '0' ? cfgInstMatch[1] : attMatches[0] || null;
+  const rawCourseId =
+    cfgCourseMatch && cfgCourseMatch[1] !== '0' && cfgCourseMatch[1] !== '1'
+      ? cfgCourseMatch[1]
+      : courseMatches[0] || null;
+
+  if (!rawAttId && !rawCourseId) return null;
+  return {
+    attendanceId: rawAttId,
+    courseId: rawCourseId,
+    title: titleMatch ? titleMatch[1].trim() : '',
+  };
+}
+
 /**
  * Resolves which Moodle Attendance module (`view.php?id=...`) and Course (`course/view.php?id=...`)
  * a given `sessid` belongs to WITHOUT submitting `qrpass`!
- * Uses a fast background HTTP GET (`context.request.get`) with the browser's MoodleSession cookie (~100ms).
+ * 1. Fast path (~80ms): Background HTTP GET (`context.request.get`) reading HTML even on 404 Moodle exception pages!
+ * 2. Fallback (~350ms): If MoodleSession had timed out and redirected to Microsoft OIDC `form_post`,
+ *    navigates `moodlePage` to `probeUrl` (NO `qrpass` -> safe, never records attendance!), completes SSO auto-login, and reads `M.cfg.contextInstanceId`.
  */
 async function resolveCourseFromSessId(moodlePage, qrUrl, sessId) {
   if (!sessId) return null;
@@ -96,51 +120,69 @@ async function resolveCourseFromSessId(moodlePage, qrUrl, sessId) {
     return sessionToCourseCache.get(sessId);
   }
 
+  const parsed = new URL(qrUrl);
+  // Probe URL has ONLY sessid (qrpass is stripped so Moodle NEVER records attendance on this request!)
+  const probeUrl = `${parsed.origin}${parsed.pathname}?sessid=${encodeURIComponent(sessId)}`;
+
+  // 1. Fast HTTP probe (note: do NOT reject non-200 status, because Moodle error pages have HTTP 404 but STILL contain M.cfg.contextInstanceId!)
   try {
-    const parsed = new URL(qrUrl);
-    // Probe URL has ONLY sessid (qrpass is stripped so Moodle does NOT record attendance yet!)
-    const probeUrl = `${parsed.origin}${parsed.pathname}?sessid=${encodeURIComponent(sessId)}`;
     const response = await moodlePage.context().request.get(probeUrl, { timeout: 3500 });
-    if (!response.ok()) return null;
-
     const html = await response.text();
-    // 1. Extract from Moodle's embedded M.cfg JSON (`contextInstanceId` is ALWAYS the exact `mod/attendance/view.php?id=...`!)
-    const cfgInstMatch = html.match(/"contextInstanceId"\s*:\s*(\d+)/);
-    const cfgCourseMatch = html.match(/"courseId"\s*:\s*(\d+)/);
-    // 2. Fallback: look for mod/attendance/view.php?id=XXXXX in breadcrumbs, form action, or cancel link
-    const attMatches = [...html.matchAll(/mod\/attendance\/view\.php\?id=(\d+)/gi)].map((m) => m[1]);
-    const courseMatches = [...html.matchAll(/course\/view\.php\?id=(\d+)/gi)].map((m) => m[1]);
-    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-
-    const info = {
-      attendanceId: cfgInstMatch ? cfgInstMatch[1] : attMatches[0] || null,
-      courseId: cfgCourseMatch ? cfgCourseMatch[1] : courseMatches[0] || null,
-      title: titleMatch ? titleMatch[1].trim() : '',
-    };
-
-    if (info.attendanceId || info.courseId) {
+    const info = parseCourseInfoFromHtml(html);
+    if (info && (info.attendanceId || info.courseId)) {
       sessionToCourseCache.set(sessId, info);
+      return info;
     }
-    return info;
-  } catch {
-    return null;
+  } catch {}
+
+  // 2. Browser fallback: if MoodleSession expired, `request.get` hits Microsoft OIDC `response_mode=form_post` (which needs browser JS auto-submit)
+  try {
+    console.log(`🔄 [SESSID FELOLDÁS] Session frissítés és tárgy azonosítása böngészőben (qrpass nélkül): sessid=${sessId}...`);
+    await moodlePage.goto(probeUrl, { waitUntil: 'domcontentloaded', timeout: 10000 });
+    await ensureMoodleLoggedIn(moodlePage, probeUrl);
+
+    // Wait briefly if Microsoft OIDC form_post is still redirecting back to Moodle
+    if (moodlePage.url().includes('microsoftonline.com')) {
+      await moodlePage.waitForURL((u) => !u.href.includes('microsoftonline.com'), { timeout: 8000 }).catch(() => {});
+    }
+
+    const liveHtml = await moodlePage.content();
+    const info = parseCourseInfoFromHtml(liveHtml);
+    if (info && (info.attendanceId || info.courseId)) {
+      sessionToCourseCache.set(sessId, info);
+      return info;
+    }
+  } catch (err) {
+    console.warn(`⚠️ [SESSID FELOLDÁS HIBA] ${err.message}`);
   }
+
+  return null;
 }
 
 /**
- * Automatically detects if Moodle redirected to a login page and clicks through KCA / Microsoft SSO.
+ * Automatically detects if Moodle redirected to a login page (or guest state `userId: 0`) and clicks through KCA / Microsoft SSO.
  */
 export async function ensureMoodleLoggedIn(page, targetUrlAfterLogin = null) {
   try {
+    // If Microsoft OIDC `form_post` auto-submit is currently in flight, let it finish first
+    if (page.url().includes('login.microsoftonline.com')) {
+      await page.waitForTimeout(1200);
+    }
+
     const currentUrl = page.url();
+    const isGuestOrLoggedOut = await page
+      .evaluate(() => window.M?.cfg?.userId === 0)
+      .catch(() => false);
+
     const isLoginPage =
+      isGuestOrLoggedOut ||
       currentUrl.includes('/login/') ||
       currentUrl.includes('login.microsoftonline.com') ||
       (await page.locator('a[href*="auth/oidc"], a[href*="login/index.php"], .login-container').count()) > 0;
 
     if (!isLoginPage) return true;
 
-    console.log('🔐 [KCA AUTO-LOGIN] Moodle bejelentkezési oldal észlelve, automatikus KCA/Microsoft beléptetés...');
+    console.log('🔐 [KCA AUTO-LOGIN] Moodle bejelentkezési oldal / lejárt session észlelve, automatikus KCA/Microsoft beléptetés...');
 
     const kcaButtonSelectors = [
       'a[href*="auth/oidc"]',
@@ -158,6 +200,19 @@ export async function ensureMoodleLoggedIn(page, targetUrlAfterLogin = null) {
       const btn = page.locator(sel).first();
       if ((await btn.count()) > 0 && (await btn.isVisible())) {
         console.log(`   -> Kattintás a belépés gombra: ${sel}`);
+        await Promise.all([
+          page.waitForLoadState('domcontentloaded', { timeout: 12000 }).catch(() => {}),
+          btn.click(),
+        ]);
+        break;
+      }
+    }
+
+    // Check again in case clicking /login/index.php revealed the KCA button on the login page
+    for (const sel of kcaButtonSelectors.slice(0, 8)) {
+      const btn = page.locator(sel).first();
+      if ((await btn.count()) > 0 && (await btn.isVisible())) {
+        console.log(`   -> Kattintás a KCA / SSO gombra: ${sel}`);
         await Promise.all([
           page.waitForLoadState('domcontentloaded', { timeout: 12000 }).catch(() => {}),
           btn.click(),
@@ -189,6 +244,9 @@ export async function ensureMoodleLoggedIn(page, targetUrlAfterLogin = null) {
           staySignedInBtn.click(),
         ]);
       }
+
+      // Wait for OIDC form_post redirect back to Moodle
+      await page.waitForURL((u) => !u.href.includes('microsoftonline.com'), { timeout: 8000 }).catch(() => {});
     }
 
     if (targetUrlAfterLogin && !page.url().includes(targetUrlAfterLogin)) {
@@ -334,31 +392,37 @@ export async function submitQrUrl(moodlePage, qrUrl, config = {}) {
 
       if (configuredIds.size > 0 || hasCourseSchedules) {
         const courseInfo = await resolveCourseFromSessId(moodlePage, qrUrl, sessId);
-        if (courseInfo && (courseInfo.attendanceId || courseInfo.courseId)) {
-          const attId = courseInfo.attendanceId;
-          const checkId = attId || courseInfo.courseId;
+        const attId = courseInfo?.attendanceId;
+        const checkId = attId || courseInfo?.courseId;
 
-          // 2/A: Check if this QR's attendance module ID is even in the user's `attendance_urls` list!
-          if (configuredIds.size > 0 && attId && !configuredIds.has(String(attId))) {
+        // Strict fail-closed protection: if `attendance_urls` whitelist is configured, NEVER submit a QR whose course couldn't be verified!
+        if (configuredIds.size > 0) {
+          if (!attId) {
+            console.warn(
+              `\n🛑 [QR SKIPPELVE - ISMERETLEN TÁRGY!] sessid=${sessId} -> Nem sikerült azonosítani a tárgyat (vagy nincs hozzáférésed a kurzushoz), biztonsági okból kihagyva!`
+            );
+            return false;
+          }
+          if (!configuredIds.has(String(attId))) {
             console.log(
               `\n🛑 [QR SKIPPELVE - NINCS A TÁRGYAID KÖZÖTT!] sessid=${sessId} -> Attendance ID: ${attId} (Course ID: ${courseInfo.courseId})\n   Indok: Ez a tárgy nincs benne az attendance_urls listádban (pl. előteljesített / nem felvett tárgy)!`
             );
             completedSessionIds.add(sessId);
             return false;
           }
+        }
 
-          // 2/B: Check `course_schedules` (including A/B week exact dates & -10 min pre-class buffer)
-          if (hasCourseSchedules) {
-            const courseCheck = checkCourseSchedule(config, checkId);
-            if (!courseCheck.allowed) {
-              console.log(
-                `\n🛑 [QR SKIPPELVE - MÁS CSOPORT ÓRÁJA!] sessid=${sessId} -> Tárgy ID: ${checkId}\n   Indok: ${courseCheck.reason}`
-              );
-              completedSessionIds.add(sessId);
-              return false;
-            } else if (courseCheck.courseName) {
-              console.log(`✅ [CSOPORT ELLENŐRZÉS OK] ${courseCheck.reason}`);
-            }
+        // 2/B: Check `course_schedules` (including A/B week exact dates & -15 min pre-class buffer)
+        if (hasCourseSchedules && checkId) {
+          const courseCheck = checkCourseSchedule(config, checkId);
+          if (!courseCheck.allowed) {
+            console.log(
+              `\n🛑 [QR SKIPPELVE - MÁS CSOPORT ÓRÁJA!] sessid=${sessId} -> Tárgy ID: ${checkId}\n   Indok: ${courseCheck.reason}`
+            );
+            completedSessionIds.add(sessId);
+            return false;
+          } else if (courseCheck.courseName) {
+            console.log(`✅ [CSOPORT ELLENŐRZÉS OK] ${courseCheck.reason}`);
           }
         }
       }
