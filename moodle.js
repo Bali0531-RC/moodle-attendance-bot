@@ -268,21 +268,6 @@ export async function ensureMoodleLoggedIn(page, targetUrlAfterLogin = null) {
 async function fillAttendanceFormIfPresent(page, code = null) {
   try {
     const initialOutcome = await inspectMoodlePageOutcome(page);
-    if (initialOutcome.status === 'recorded') {
-      return {
-        success: true,
-        status: 'recorded',
-        detail: `Sikeresen rögzítve! Moodle válasz: "${initialOutcome.message}"`,
-      };
-    }
-    if (initialOutcome.status === 'already_recorded') {
-      return {
-        success: true,
-        status: 'already_recorded',
-        detail: `Már korábban rögzítve volt! Moodle válasz: "${initialOutcome.message}"`,
-      };
-    }
-
     const submitBtn = page
       .locator(
         'input[name="submitbutton"], button[name="submitbutton"], form[action*="attendance.php"] input[type="submit"], form[action*="attendance.php"] button[type="submit"]'
@@ -292,6 +277,13 @@ async function fillAttendanceFormIfPresent(page, code = null) {
     const hasForm = (await submitBtn.count()) > 0 && (await submitBtn.isVisible());
 
     if (!hasForm) {
+      if (initialOutcome.success) {
+        return {
+          success: true,
+          status: initialOutcome.status,
+          detail: `Moodle válasz: "${initialOutcome.message}"`,
+        };
+      }
       return {
         success: false,
         status: initialOutcome.status,
@@ -305,7 +297,10 @@ async function fillAttendanceFormIfPresent(page, code = null) {
       )
       .first();
 
-    if (code && (await passInput.count()) > 0 && (await passInput.isVisible())) {
+    if (code) {
+      if ((await passInput.count()) === 0 || !(await passInput.isVisible())) {
+        return { success: false, status: 'error', detail: 'Nem található kitölthető jelszómező az űrlapon.' };
+      }
       await passInput.fill(code);
     }
 
@@ -335,18 +330,18 @@ async function fillAttendanceFormIfPresent(page, code = null) {
     ]);
 
     const afterOutcome = await inspectMoodlePageOutcome(page);
-    if (afterOutcome.status === 'error') {
+    if (!afterOutcome.success) {
       return {
         success: false,
-        status: 'error',
-        detail: `Sikertelen mentés! Moodle válasz: "${afterOutcome.message}"`,
+        status: afterOutcome.status,
+        detail: `A Moodle nem erősítette meg a mentést. Válasz: "${afterOutcome.message}"`,
       };
     }
 
     return {
       success: true,
       status: afterOutcome.status,
-      detail: `Űrlap beküldve ("Present")! Moodle válasz: "${afterOutcome.message}"`,
+      detail: `Moodle megerősítés: "${afterOutcome.message}"`,
     };
   } catch (err) {
     return { success: false, status: 'error', detail: `Hiba az űrlap kitöltésekor: ${err.message}` };
@@ -369,7 +364,7 @@ export async function submitQrUrl(moodlePage, qrUrl, config = {}) {
   }
   if (sessId && inFlightSessionIds.has(sessId)) {
     console.log(`⏭️ [QR DEDUPE] A(z) sessid=${sessId} megnyitása már folyamatban van, duplikált kérés átugrása!`);
-    return true;
+    return false;
   }
 
   if (sessId) inFlightSessionIds.add(sessId);
@@ -407,7 +402,6 @@ export async function submitQrUrl(moodlePage, qrUrl, config = {}) {
             console.log(
               `\n🛑 [QR SKIPPELVE - NINCS A TÁRGYAID KÖZÖTT!] sessid=${sessId} -> Attendance ID: ${attId} (Course ID: ${courseInfo.courseId})\n   Indok: Ez a tárgy nincs benne az attendance_urls listádban (pl. előteljesített / nem felvett tárgy)!`
             );
-            completedSessionIds.add(sessId);
             return false;
           }
         }
@@ -419,7 +413,6 @@ export async function submitQrUrl(moodlePage, qrUrl, config = {}) {
             console.log(
               `\n🛑 [QR SKIPPELVE - MÁS CSOPORT ÓRÁJA!] sessid=${sessId} -> Tárgy ID: ${checkId}\n   Indok: ${courseCheck.reason}`
             );
-            completedSessionIds.add(sessId);
             return false;
           } else if (courseCheck.courseName) {
             console.log(`✅ [CSOPORT ELLENŐRZÉS OK] ${courseCheck.reason}`);
@@ -523,8 +516,8 @@ export async function submitSixCharCodeAcrossLinks(moodlePage, code, config) {
           const sessId = sessMatch ? sessMatch[1] : null;
 
           if (sessId && completedSessionIds.has(sessId)) {
-            console.log(`ℹ️ [MÁR RÖGZÍTVE] A(z) ${courseUrl} (sessid=${sessId}) órára már be vagy írva!`);
-            return true;
+            console.log(`ℹ️ [KORÁBBAN MEGERŐSÍTVE] ${courseUrl} (sessid=${sessId}): más tárgyak keresése folytatódik.`);
+            continue;
           }
 
           console.log(`🎯 [TALÁLAT] Aktív jelenlét űrlap megtalálva itt: ${courseUrl}`);
@@ -550,7 +543,7 @@ export async function submitSixCharCodeAcrossLinks(moodlePage, code, config) {
 
     if (attempt < maxAttempts) {
       console.log(
-        `⏳ [BUFFER VÁRAKOZÁS] Még egyik tárgyon sincs nyitva a "Submit attendance" gomb (pl. óra előtt vagyunk). Újrapróbálás ${
+        `⏳ [BUFFER VÁRAKOZÁS] Nem sikerült megerősített jelenlétet rögzíteni. Újrapróbálás ${
           retryWaitMs / 1000
         } mp múlva...`
       );
@@ -558,6 +551,6 @@ export async function submitSixCharCodeAcrossLinks(moodlePage, code, config) {
     }
   }
 
-  console.error(`❌ [LEJÁRT] Nem nyílt meg jelenlét űrlap a(z) "${code}" kódhoz.`);
+  console.error(`❌ [LEJÁRT] Nem sikerült megerősített jelenlétet rögzíteni a(z) "${code}" kóddal.`);
   return false;
 }
