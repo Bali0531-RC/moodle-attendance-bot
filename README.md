@@ -209,3 +209,112 @@ docker compose up -d --build
 docker compose logs -f
 ```
 A konténer `restart: unless-stopped` beállítással fut, `Europe/Budapest` időzónával, és a `config.json` / `auth.json` / `.passkeys.json` fájlokat közvetlenül csatolja (volume mount), így bármikor szerkesztheted a `config.json`-t a szerveren újraindítás nélkül.
+
+---
+
+## 🔄 6. Frissítés (How to update)
+
+Válaszd ki, hogyan töltötted le a projektet, és hogyan futtatod. A parancsokat a projekt mappájában futtasd, kivéve ahol mást írunk.
+
+**Frissítés előtt:** készíts biztonsági másolatot a saját fájljaidról: `config.json`, `.env`, `auth.json`, `.passkeys.json`, `.copilot-token.json`, `.neptun-calendar.ics` és a teljes `.browser-profile/` mappa, ha léteznek. A böngészőprofilt csak a bot leállítása után másold. Ezek között jelszavak, hozzáférési tokenek és privát kulcsok lehetnek: a másolatot biztonságos helyen tárold, ne oszd meg és ne töltsd fel nyilvánosan!
+
+### 1. Ha `git clone` segítségével töltötted le
+
+A `git pull` az aktuális ág követett távoli ágáról frissít. Először ellenőrizd az ágat és a helyi változtatásokat:
+
+```bash
+git status
+```
+
+Ha a `git pull` hibát jelez, **ne folytasd az indítással**: ellenőrizd a helyi változtatásokat, a kiválasztott ágat és a távoli követési ágat. Ne töröld vagy írd felül a saját módosításaidat a frissítés kedvéért. A Git által figyelmen kívül hagyott személyes fájlok a helyükön maradnak; ennek ellenére készíts róluk biztonsági másolatot.
+
+#### 1/a. Docker Compose
+
+1. Állítsd le a konténert:
+
+   ```bash
+   docker compose stop
+   ```
+
+2. Készíts másolatot a fenti személyes fájlokról, majd frissítsd a kódot:
+
+   ```bash
+   git pull --ff-only
+   ```
+
+3. Sikeres `git pull` után építsd újra az image-et és indítsd újra a konténert:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+4. Ellenőrizd az indulást:
+
+   ```bash
+   docker compose logs -f
+   ```
+
+   A logkövetésből `Ctrl+C`-vel léphetsz ki; ez nem állítja le a konténert. Az újraépítés fontos: a `git pull` önmagában nem frissíti a már futó konténerben lévő kódot.
+
+#### 1/b. Natív futtatás
+
+1. Állítsd le a botot: az interaktív termináljába írd be az `exit` parancsot, és várd meg, amíg bezárul. Ha háttérfolyamatként futtatod, a használt folyamatkezelővel állítsd le.
+2. Készítsd el a biztonsági másolatot, majd frissítsd a kódot:
+
+   ```bash
+   git pull --ff-only
+   ```
+
+3. Sikeres `git pull` után frissítsd a függőségeket és a Playwright Chromiumot:
+
+   ```bash
+   pnpm install
+   pnpm exec playwright install chromium
+   ```
+
+4. Indítsd újra a botot:
+
+   ```bash
+   pnpm start
+   ```
+
+### 2. Ha ZIP-ként töltötted le
+
+A ZIP-es mappában nem feltétlenül van Git-előzmény, ezért a `git pull` általában nem használható. **Ne töröld a régi mappát**, és ne írd felül a saját `config.json`-odat a példakonfigurációval.
+
+1. Állítsd le a botot: natív futtatásnál írd be az `exit` parancsot, Docker esetén pedig **a régi projektmappában** futtasd:
+
+   ```bash
+   docker compose down
+   ```
+
+   Ez eltávolítja a régi Compose-konténert, így az új mappából indított konténer neve nem ütközik vele. A csatolt helyi fájlokat és mappákat nem törli; ne használj `-v` kapcsolót.
+
+2. Készítsd el a fenti biztonsági másolatot. Töltsd le a legfrissebb ZIP-et a [GitHub repository](https://github.com/Bali0531-RC/moodle-attendance-bot) oldalán a **Code → Download ZIP** menüponttal, és csomagold ki **egy új, külön mappába**.
+3. A leállított régi mappából másold át az új projektmappába a saját `config.json`, `.env`, `auth.json`, `.passkeys.json`, `.copilot-token.json`, `.neptun-calendar.ics` fájlokat és a teljes `.browser-profile/` mappát, amelyek nálad léteznek. A `config.example.json` nem helyettesíti a saját beállításaidat. A `node_modules/` mappát ne másold át.
+
+   Windows Fájlkezelőben kapcsold be a **Nézet → Megjelenítés → Rejtett elemek** lehetőséget, hogy a ponttal kezdődő fájlokat és mappákat is lásd. Ha egy opcionális fájl még nem létezik, ne hozz létre helyette üreset; Docker esetén viszont ellenőrizd a `docker-compose.yml` által előírt fájlokat és csatolásokat.
+4. Nyiss terminált az **új mappában**, és folytasd a megfelelő résszel:
+
+#### 2/a. Docker Compose
+
+Az új mappában építsd újra és indítsd el a konténert:
+
+```bash
+docker compose up -d --build
+docker compose logs -f
+```
+
+A logkövetésből `Ctrl+C`-vel léphetsz ki. Ellenőrizd, hogy az új mappába másolt `config.json` és sessionfájlok vannak használatban, és szükség esetén jelentkezz be újra. Csak az új telepítés ellenőrzése után dönts a régi mappa és a biztonsági másolat sorsáról.
+
+#### 2/b. Natív futtatás
+
+Az új mappában telepítsd a függőségeket és a Chromiumot, majd indítsd el a botot:
+
+```bash
+pnpm install
+pnpm exec playwright install chromium
+pnpm start
+```
+
+Ellenőrizd a `status` paranccsal a Messenger és a Moodle fülek címét és állapotát; szükség esetén jelentkezz be újra. Csak az új telepítés ellenőrzése után dönts a régi mappa és a biztonsági másolat sorsáról.
