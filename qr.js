@@ -10,12 +10,42 @@ import { readBarcodesFromImageFile } from 'zxing-wasm/reader';
 // Pre-warm ZXing WebAssembly module on startup so real-time decoding takes ~50ms
 readBarcodesFromImageFile(new Blob([new Uint8Array([0])]), { formats: ['QRCode'] }).catch(() => {});
 
+let sharpPromise = null;
+function getSharp() {
+  if (!sharpPromise) {
+    sharpPromise = import('sharp')
+      .then((m) => m.default || m)
+      .catch(() => null);
+  }
+  return sharpPromise;
+}
+
+/**
+ * Normalizes modern Messenger formats (AVIF / WebP / HEIF) into standard PNG so ZXing, jsQR, and zbarimg can all decode them.
+ */
+async function normalizeImageBuffer(buffer) {
+  if (!buffer || buffer.length < 4) return buffer;
+  const isPng = buffer[0] === 0x89 && buffer[1] === 0x50;
+  const isJpeg = buffer[0] === 0xff && buffer[1] === 0xd8;
+  if (isPng || isJpeg) return buffer;
+
+  const sharp = await getSharp();
+  if (sharp) {
+    try {
+      return await sharp(buffer).png().toBuffer();
+    } catch {}
+  }
+  return buffer;
+}
+
 /**
  * Decodes a QR code from an image Buffer in memory (~50ms).
  * 1. Primary: zxing-wasm (C++ ZXing compiled to WebAssembly with tryHarder + adaptive thresholding - reads angled/blue projector photos in ~50ms!)
  * 2. Fallback: jsQR (in-memory) & zbarimg
  */
-export async function decodeQrFromBuffer(buffer) {
+export async function decodeQrFromBuffer(inputBuffer) {
+  const buffer = await normalizeImageBuffer(inputBuffer);
+
   // 1. Primary: ZXing-WASM (handles projector glare, perspective distortion, phone photos in ~50ms)
   try {
     const blob = new Blob([buffer]);

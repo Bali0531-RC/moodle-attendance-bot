@@ -1,9 +1,13 @@
+import dns from 'node:dns';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import { decodeQrFromBuffer } from './qr.js';
+
+// Prefer IPv4 over IPv6 so fbcdn.net requests never stall for 4s+ on servers/Docker without IPv6 routing
+dns.setDefaultResultOrder('ipv4first');
 import { extractSixCharCode, getAiCredentials, loginGitHubCopilotDeviceFlow } from './extractor.js';
 import { ensureMoodleLoggedIn, submitQrUrl, submitSixCharCodeAcrossLinks } from './moodle.js';
 import { checkActiveSchedule } from './schedule.js';
@@ -32,9 +36,31 @@ fs.watchFile(CONFIG_PATH, () => {
 // Deduplication sets so we only process NEW messages/images arriving after bot startup
 const processedTexts = new Set();
 const processedImageUrls = new Set();
+const recentImageBuffers = new Map();
 const recentChatHistory = [];
 let activeSubmissionPromise = Promise.resolve();
 let sixCharActiveCount = 0;
+
+/**
+ * Filters out Messenger profile pictures, avatars, reaction icons, emojis, and small UI thumbnails.
+ */
+function isIgnorableMessengerImage(imgSrc) {
+  if (!imgSrc) return true;
+  if (
+    imgSrc.includes('emoji') ||
+    imgSrc.includes('static.xx.fbcdn.net') ||
+    imgSrc.includes('/rsrc.php') ||
+    imgSrc.includes('/t39.30808-1/') ||
+    imgSrc.includes('/t1.30497-1/')
+  ) {
+    return true;
+  }
+  // Ignore small square avatar thumbnails (e.g. stp=dst-jpg_s100x100_tt6, p50x50, p36x36, s60x60)
+  if (/[/_?&][sp](?:16x16|20x20|24x24|28x28|32x32|36x36|40x40|48x48|50x50|60x60|64x64|75x75|80x80|96x96|100x100)(?:[_&./]|$)/i.test(imgSrc)) {
+    return true;
+  }
+  return false;
+}
 
 /**
  * Checks if the context actually has a logged-in Messenger user cookie (c_user + xs)
@@ -214,7 +240,8 @@ async function restorePortableAuthStateIfPresent(context) {
 }
 
 /**
- * Downloads an image URL using the Messenger page's context/cookies into memory Buffer.
+ * Downloads an image URL using Chromium's in-memory response cache first (0ms),
+ * falling back to Playwright's request context if needed.
  */
 async function fetchImageBuffer(context, page, imgSrc) {
   try {
@@ -234,9 +261,24 @@ async function fetchImageBuffer(context, page, imgSrc) {
       }, imgSrc);
       return Buffer.from(base64, 'base64');
     }
-    const response = await context.request.get(imgSrc, { timeout: 4000 });
-    if (response.ok()) {
-      return await response.body();
+
+    // 1. Instant 0ms hit from Chromium's own network response stream (avoids re-downloading from fbcdn.net)
+    const cached = recentImageBuffers.get(imgSrc);
+    if (cached) {
+      return cached;
+    }
+
+    // 2. Fallback HTTP fetch with 10s timeout + 1 retry
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const response = await context.request.get(imgSrc, { timeout: 10000 });
+        if (response.ok()) {
+          return await response.body();
+        }
+        break;
+      } catch (reqErr) {
+        if (attempt === 2) throw reqErr;
+      }
     }
   } catch (err) {
     console.warn(`[KÉP LETÖLTÉS HIBA] ${err.message}`);
@@ -249,7 +291,7 @@ async function fetchImageBuffer(context, page, imgSrc) {
  */
 async function onNewChatImage(context, messengerPage, moodlePage, imgSrc, bypassSchedule = false) {
   if (!imgSrc || processedImageUrls.has(imgSrc)) return;
-  if (imgSrc.includes('emoji') || imgSrc.includes('p50x50') || imgSrc.includes('p36x36')) return;
+  if (isIgnorableMessengerImage(imgSrc)) return;
 
   processedImageUrls.add(imgSrc);
 
@@ -330,6 +372,25 @@ function triggerSixCharSubmission(moodlePage, code) {
  * trigger Node.js callbacks in < 50ms without polling delay.
  */
 async function attachMessengerObserver(context, messengerPage, moodlePage) {
+  // Capture non-avatar images directly from Chromium's network stream so fetchImageBuffer takes 0ms
+  messengerPage.on('response', async (res) => {
+    try {
+      const url = res.url();
+      if (!url.startsWith('http') || isIgnorableMessengerImage(url)) return;
+      const ct = res.headers()['content-type'] || '';
+      if (res.request().resourceType() !== 'image' && !ct.startsWith('image/')) return;
+      if (!res.ok()) return;
+      const body = await res.body();
+      if (body && body.length > 500) {
+        recentImageBuffers.set(url, body);
+        if (recentImageBuffers.size > 40) {
+          const oldestKey = recentImageBuffers.keys().next().value;
+          recentImageBuffers.delete(oldestKey);
+        }
+      }
+    } catch {}
+  });
+
   await messengerPage.exposeFunction('__botOnNewText', (text) => {
     onNewChatMessage(moodlePage, text, false);
   });
@@ -343,11 +404,13 @@ async function attachMessengerObserver(context, messengerPage, moodlePage) {
     window.__attendanceObserverActive = true;
 
     const seenTextNodes = new WeakSet();
-    const seenImgNodes = new WeakSet();
+    const seenImgSrcs = new Set();
 
     const markExisting = () => {
       document.querySelectorAll('div[dir="auto"]').forEach((el) => seenTextNodes.add(el));
-      document.querySelectorAll('img[src]').forEach((img) => seenImgNodes.add(img));
+      document.querySelectorAll('img[src]').forEach((img) => {
+        if (img.src) seenImgSrcs.add(img.src);
+      });
     };
 
     setTimeout(() => {
@@ -356,17 +419,24 @@ async function attachMessengerObserver(context, messengerPage, moodlePage) {
 
       const scanNode = (root) => {
         if (!root || !root.querySelectorAll) return;
+        // Ignore the left sidebar conversation list so other chats' previews/avatars never fire
+        if (root.closest?.('[role="navigation"]')) return;
 
         const imgs = root.matches?.('img[src]') ? [root] : [...root.querySelectorAll('img[src]')];
         for (const img of imgs) {
-          if (seenImgNodes.has(img)) continue;
+          if (img.closest('[role="navigation"]')) continue;
           const checkImg = () => {
-            if (img.src && (img.naturalWidth === 0 || img.naturalWidth >= 80)) {
-              seenImgNodes.add(img);
+            if (
+              img.src &&
+              !seenImgSrcs.has(img.src) &&
+              img.naturalWidth >= 120 &&
+              img.naturalHeight >= 120
+            ) {
+              seenImgSrcs.add(img.src);
               window.__botOnNewImage(img.src);
             }
           };
-          if (img.complete) checkImg();
+          if (img.complete && img.naturalWidth > 0) checkImg();
           else img.addEventListener('load', checkImg, { once: true });
         }
 
@@ -374,7 +444,7 @@ async function attachMessengerObserver(context, messengerPage, moodlePage) {
           ? [root]
           : [...root.querySelectorAll('div[dir="auto"]')];
         for (const div of textDivs) {
-          if (seenTextNodes.has(div)) continue;
+          if (seenTextNodes.has(div) || div.closest('[role="navigation"]')) continue;
           seenTextNodes.add(div);
           const txt = (div.innerText || '').trim();
           if (txt && txt.length >= 2 && txt.length <= 300) {
